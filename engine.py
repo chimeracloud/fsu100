@@ -1,0 +1,1414 @@
+"""Live betting engine — the heart of FSU100.
+
+Manages the Betfair streaming session, applies the active strategy plugin
+to incoming market updates, and (in ``LIVE`` mode) places bets on the
+exchange. Also tracks open orders, settles cleared bets, and persists
+daily results to GCS.
+
+Operating modes
+---------------
+* ``LIVE``    — stream is open, bets are placed.
+* ``DRY_RUN`` — stream is open, decisions are logged but no bets are sent.
+* ``STOPPED`` — stream is closed, no work is done. Default on startup.
+
+Threading model
+---------------
+The engine combines async (FastAPI / event bus) with sync (Betfair stream
+socket, periodic orders/settlement pollers). Mutable state lives behind
+``threading.RLock`` so the streaming worker thread and asyncio tasks can
+read/write it safely. Sync code publishes events back to the async bus via
+:meth:`core.events.EventBus.publish_threadsafe`.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import threading
+from contextlib import suppress
+from dataclasses import dataclass, field
+from datetime import date, datetime, timezone
+from typing import Any, Iterable
+
+from core.config import AppSettings, get_settings
+from core.events import EventBus
+from core.logging import get_logger
+from core.plugin_store import PluginNotFoundError, PluginStore
+from evaluator import evaluate
+from models.decisions import BetDecision, NoBet, Side
+from models.schemas import (
+    AccountResponse,
+    AdminConfig,
+    AdminStats,
+    AdminStatus,
+    BetDecisionView,
+    EngineMode,
+    HistoryResponse,
+    MarketsResponse,
+    MarketView,
+    PluginConfig,
+    PositionView,
+    PositionsResponse,
+    ResultsResponse,
+    RunnerSnapshot,
+    SettledBet,
+    SettledResponse,
+    StreamStatus,
+)
+from services.betfair_service import BetfairService, BetfairServiceError
+from services.gcs_service import GcsService, parse_jsonl
+
+logger = get_logger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Data structures
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class EngineRuntimeConfig:
+    """Operator-configurable runtime parameters held in memory.
+
+    Distinct from :class:`core.config.AppSettings` (process-level, mostly
+    immutable). This is the block edited via ``PUT /admin/config`` and read
+    by the engine on every market update.
+    """
+
+    log_level: str
+    activity_log_size: int
+    results_bucket: str
+    active_plugin: str
+    countries: list[str]
+    market_types: list[str]
+    point_value: float
+    customer_strategy_ref: str
+
+    def to_admin_config(self) -> AdminConfig:
+        """Produce the :class:`AdminConfig` view served by the admin API."""
+
+        return AdminConfig(
+            log_level=self.log_level,  # type: ignore[arg-type]
+            activity_log_size=self.activity_log_size,
+            results_bucket=self.results_bucket,
+            active_plugin=self.active_plugin,
+            countries=list(self.countries),
+            market_types=list(self.market_types),
+            point_value=self.point_value,
+            customer_strategy_ref=self.customer_strategy_ref,
+        )
+
+
+@dataclass
+class _OpenOrder:
+    """In-memory record of one currently-open Betfair order."""
+
+    bet_id: str
+    market_id: str
+    selection_id: int
+    runner_name: str
+    side: str
+    price: float
+    stake: float
+    liability: float
+    rule_applied: str | None
+    placed_at: datetime
+    matched_size: float
+    unmatched_size: float
+
+
+@dataclass
+class _SettledBetRecord:
+    """In-memory record of one settled bet."""
+
+    bet_id: str
+    market_id: str
+    selection_id: int
+    runner_name: str
+    side: str
+    price: float
+    stake: float
+    liability: float
+    rule_applied: str | None
+    outcome: str
+    pnl: float
+    settled_at: datetime
+
+    def to_view(self) -> SettledBet:
+        return SettledBet(
+            bet_id=self.bet_id,
+            market_id=self.market_id,
+            selection_id=self.selection_id,
+            runner_name=self.runner_name,
+            side=self.side,  # type: ignore[arg-type]
+            price=self.price,
+            stake=self.stake,
+            liability=self.liability,
+            rule_applied=self.rule_applied,
+            outcome=self.outcome,  # type: ignore[arg-type]
+            pnl=self.pnl,
+            settled_at=self.settled_at,
+        )
+
+
+@dataclass
+class _MarketCacheEntry:
+    """Cached snapshot of the latest streamed ``MarketBook`` for one market."""
+
+    market_id: str
+    venue: str | None
+    country: str | None
+    market_type: str | None
+    market_time: datetime | None
+    in_play: bool
+    runners: list[RunnerSnapshot]
+    last_update: datetime
+    evaluated: bool = False
+
+
+@dataclass
+class _Stats:
+    """Aggregated counters maintained for ``GET /admin/stats``."""
+
+    bets_placed: int = 0
+    bets_won: int = 0
+    bets_lost: int = 0
+    bets_void: int = 0
+    bets_pending: int = 0
+    markets_processed: int = 0
+    total_stake: float = 0.0
+    total_liability: float = 0.0
+    total_pnl: float = 0.0
+    open_exposure: float = 0.0
+    stats_window_start: datetime = field(
+        default_factory=lambda: datetime.now(timezone.utc)
+    )
+
+    def reset(self) -> None:
+        """Zero every counter and reset the window start to ``now``."""
+
+        self.bets_placed = 0
+        self.bets_won = 0
+        self.bets_lost = 0
+        self.bets_void = 0
+        self.bets_pending = 0
+        self.markets_processed = 0
+        self.total_stake = 0.0
+        self.total_liability = 0.0
+        self.total_pnl = 0.0
+        self.open_exposure = 0.0
+        self.stats_window_start = datetime.now(timezone.utc)
+
+
+# ---------------------------------------------------------------------------
+# Live engine
+# ---------------------------------------------------------------------------
+
+
+class LiveEngine:
+    """Runs the live betting workflow.
+
+    The engine is a long-lived singleton owned by the FastAPI lifespan. It
+    reads strategy configuration from the supplied :class:`PluginStore`,
+    talks to Betfair via :class:`BetfairService`, persists results via
+    :class:`GcsService`, and emits lifecycle events via :class:`EventBus`.
+    """
+
+    _MAX_RECENT_SETTLED = 1_000
+
+    def __init__(
+        self,
+        *,
+        settings: AppSettings,
+        plugins: PluginStore,
+        betfair: BetfairService,
+        gcs: GcsService,
+        events: EventBus,
+    ) -> None:
+        self._settings = settings
+        self._plugins = plugins
+        self._betfair = betfair
+        self._gcs = gcs
+        self._events = events
+
+        self._lock = threading.RLock()
+        self._mode = EngineMode.STOPPED
+        self._stream_status = StreamStatus.DISCONNECTED
+        self._started_at: datetime | None = None
+
+        default_plugin = self._resolve_default_plugin()
+        self._runtime_config = EngineRuntimeConfig(
+            log_level=settings.log_level,
+            activity_log_size=settings.activity_log_size,
+            results_bucket=settings.results_bucket,
+            active_plugin=default_plugin.name,
+            countries=list(default_plugin.source.filters.countries),
+            market_types=list(default_plugin.source.filters.market_types),
+            point_value=default_plugin.staking.point_value,
+            customer_strategy_ref=settings.customer_strategy_ref,
+        )
+
+        self._market_cache: dict[str, _MarketCacheEntry] = {}
+        self._open_orders: dict[str, _OpenOrder] = {}
+        self._recent_settled: list[_SettledBetRecord] = []
+        self._known_settled_bet_ids: set[str] = set()
+        self._stats = _Stats()
+
+        self._processing_thread: threading.Thread | None = None
+        self._processing_stop = threading.Event()
+        self._poll_orders_task: asyncio.Task[None] | None = None
+        self._poll_settlement_task: asyncio.Task[None] | None = None
+
+    # ------------------------------------------------------------------
+    # Status accessors
+    # ------------------------------------------------------------------
+
+    def status(self) -> AdminStatus:
+        """Return the snapshot served by ``GET /admin/status``."""
+
+        with self._lock:
+            uptime = 0.0
+            if self._started_at is not None:
+                uptime = (
+                    datetime.now(timezone.utc) - self._started_at
+                ).total_seconds()
+            try:
+                active_plugin = self._plugins.get(self._runtime_config.active_plugin)
+                plugin_version: str | None = active_plugin.version
+                plugin_name: str | None = active_plugin.name
+            except PluginNotFoundError:
+                plugin_version = None
+                plugin_name = None
+            return AdminStatus(
+                service=self._settings.service_name,
+                version=self._settings.version,
+                environment=self._settings.environment,
+                uptime_seconds=uptime,
+                timestamp=datetime.now(timezone.utc),
+                mode=self._mode,
+                active_plugin=plugin_name,
+                active_plugin_version=plugin_version,
+                stream_status=self._stream_status,
+                markets_in_cache=len(self._market_cache),
+            )
+
+    def get_runtime_config(self) -> AdminConfig:
+        with self._lock:
+            return self._runtime_config.to_admin_config()
+
+    def update_runtime_config(self, payload: AdminConfig) -> AdminConfig:
+        """Apply ``PUT /admin/config`` and return the resulting config."""
+
+        with self._lock:
+            self._plugins.get(payload.active_plugin)
+            self._runtime_config = EngineRuntimeConfig(
+                log_level=payload.log_level,
+                activity_log_size=payload.activity_log_size,
+                results_bucket=payload.results_bucket,
+                active_plugin=payload.active_plugin,
+                countries=list(payload.countries),
+                market_types=list(payload.market_types),
+                point_value=payload.point_value,
+                customer_strategy_ref=(
+                    payload.customer_strategy_ref
+                    or self._settings.customer_strategy_ref
+                ),
+            )
+            return self._runtime_config.to_admin_config()
+
+    def stats(self) -> AdminStats:
+        with self._lock:
+            stats = self._stats
+            decisive = stats.bets_won + stats.bets_lost
+            strike_rate = (
+                round(stats.bets_won / decisive, 4) if decisive else 0.0
+            )
+            return AdminStats(
+                bets_placed=stats.bets_placed,
+                bets_won=stats.bets_won,
+                bets_lost=stats.bets_lost,
+                bets_void=stats.bets_void,
+                bets_pending=stats.bets_pending,
+                strike_rate=strike_rate,
+                markets_processed=stats.markets_processed,
+                total_stake=round(stats.total_stake, 2),
+                total_liability=round(stats.total_liability, 2),
+                total_pnl=round(stats.total_pnl, 2),
+                open_exposure=round(stats.open_exposure, 2),
+                stats_window_start=stats.stats_window_start,
+            )
+
+    def reset_stats(self) -> None:
+        with self._lock:
+            self._stats.reset()
+            self._recent_settled.clear()
+            self._known_settled_bet_ids.clear()
+
+    # ------------------------------------------------------------------
+    # GUI views
+    # ------------------------------------------------------------------
+
+    def markets(self) -> MarketsResponse:
+        """Return the snapshot served by ``GET /api/markets``."""
+
+        now = datetime.now(timezone.utc)
+        out: list[MarketView] = []
+        with self._lock:
+            for entry in self._market_cache.values():
+                seconds_to_off: float | None = None
+                if entry.market_time is not None:
+                    seconds_to_off = (entry.market_time - now).total_seconds()
+                out.append(
+                    MarketView(
+                        market_id=entry.market_id,
+                        venue=entry.venue,
+                        country=entry.country,
+                        market_type=entry.market_type,
+                        market_time=entry.market_time,
+                        seconds_to_off=seconds_to_off,
+                        in_play=entry.in_play,
+                        evaluated=entry.evaluated,
+                        runners=list(entry.runners),
+                    )
+                )
+        out.sort(
+            key=lambda m: m.market_time or datetime.max.replace(tzinfo=timezone.utc)
+        )
+        return MarketsResponse(markets=out)
+
+    def positions(self) -> PositionsResponse:
+        """Return the snapshot served by ``GET /api/positions``."""
+
+        with self._lock:
+            views = [
+                PositionView(
+                    market_id=o.market_id,
+                    selection_id=o.selection_id,
+                    runner_name=o.runner_name,
+                    side=o.side,  # type: ignore[arg-type]
+                    price=o.price,
+                    stake=o.stake,
+                    liability=o.liability,
+                    matched_size=o.matched_size,
+                    unmatched_size=o.unmatched_size,
+                    rule_applied=o.rule_applied,
+                    bet_id=o.bet_id,
+                    placed_at=o.placed_at,
+                    pnl_if_settled_now=None,
+                )
+                for o in self._open_orders.values()
+            ]
+            total_exposure = round(self._stats.open_exposure, 2)
+        return PositionsResponse(positions=views, total_exposure=total_exposure)
+
+    def today_results(self) -> ResultsResponse:
+        """Return the snapshot served by ``GET /api/results``."""
+
+        with self._lock:
+            bets = [r.to_view() for r in self._recent_settled]
+        return ResultsResponse(bets=bets, summary=self.stats())
+
+    def history(
+        self,
+        *,
+        range_start: date,
+        range_end: date,
+        page: int,
+        page_size: int,
+    ) -> HistoryResponse:
+        """Return paginated settled-bet history loaded from GCS."""
+
+        if range_end < range_start:
+            raise ValueError("range_end must be on or after range_start")
+        bets: list[SettledBet] = []
+        cursor = range_start
+        while cursor <= range_end:
+            blob_name = self._gcs.settled_blob_name(cursor)
+            text = self._gcs.download_text(self._runtime_config.results_bucket, blob_name)
+            if text:
+                for entry in parse_jsonl(text):
+                    try:
+                        bets.append(SettledBet.model_validate(entry))
+                    except Exception:
+                        logger.warning(
+                            "skipping unparseable settled-bet entry",
+                            extra={"blob": blob_name},
+                        )
+            cursor = date.fromordinal(cursor.toordinal() + 1)
+
+        bets.sort(key=lambda b: b.settled_at, reverse=True)
+        total = len(bets)
+        start = (page - 1) * page_size
+        end = start + page_size
+        return HistoryResponse(
+            bets=bets[start:end],
+            page=page,
+            page_size=page_size,
+            total=total,
+            range_start=range_start,
+            range_end=range_end,
+        )
+
+    def settled(self, *, range_start: date, range_end: date) -> SettledResponse:
+        """Return the response served by ``GET /api/settled``.
+
+        When the engine is authenticated, prefers a fresh pull from
+        Betfair so the AIM agent gets the canonical view; falls back to
+        the GCS log otherwise.
+        """
+
+        if self._betfair.is_authenticated:
+            try:
+                bets = self._fetch_cleared_bets(range_start, range_end)
+                return SettledResponse(
+                    bets=bets,
+                    range_start=range_start,
+                    range_end=range_end,
+                    total=len(bets),
+                )
+            except BetfairServiceError:
+                logger.exception("falling back to GCS for settled bets")
+
+        history = self.history(
+            range_start=range_start,
+            range_end=range_end,
+            page=1,
+            page_size=10_000,
+        )
+        return SettledResponse(
+            bets=list(history.bets),
+            range_start=range_start,
+            range_end=range_end,
+            total=history.total,
+        )
+
+    def account(self) -> AccountResponse:
+        """Return the snapshot served by ``GET /api/account``."""
+
+        if not self._betfair.is_authenticated:
+            raise BetfairServiceError(
+                "engine is not authenticated; start LIVE or DRY_RUN mode first"
+            )
+        funds = self._betfair.get_account_funds()
+        return AccountResponse(
+            available_to_bet=float(getattr(funds, "available_to_bet_balance", 0.0)),
+            exposure=float(getattr(funds, "exposure", 0.0)),
+            points_balance=float(getattr(funds, "points_balance", 0.0) or 0.0),
+            wallet=getattr(funds, "wallet", "UK") or "UK",
+            retrieved_at=datetime.now(timezone.utc),
+        )
+
+    # ------------------------------------------------------------------
+    # Mode transitions
+    # ------------------------------------------------------------------
+
+    async def start_live(self) -> AdminStatus:
+        return await self._transition_to(EngineMode.LIVE)
+
+    async def start_dry_run(self) -> AdminStatus:
+        return await self._transition_to(EngineMode.DRY_RUN)
+
+    async def stop(self) -> AdminStatus:
+        return await self._transition_to(EngineMode.STOPPED)
+
+    async def _transition_to(self, target: EngineMode) -> AdminStatus:
+        with self._lock:
+            current = self._mode
+            if current is target:
+                return self.status()
+
+        if target is EngineMode.STOPPED:
+            await self._teardown_session(reason="operator stopped engine")
+        else:
+            try:
+                self._spin_up_session()
+            except Exception as exc:
+                with self._lock:
+                    self._mode = EngineMode.STOPPED
+                    self._stream_status = StreamStatus.ERROR
+                await self._events.publish(
+                    "error",
+                    {"message": str(exc)},
+                    detail=f"failed to enter {target.value}: {exc}",
+                )
+                raise
+
+        with self._lock:
+            self._mode = target
+            if target is not EngineMode.STOPPED:
+                self._started_at = datetime.now(timezone.utc)
+            self._start_async_pollers()
+
+        await self._events.publish(
+            "mode_changed",
+            {"old_mode": current.value, "new_mode": target.value},
+            detail=f"mode changed from {current.value} to {target.value}",
+        )
+        return self.status()
+
+    def _spin_up_session(self) -> None:
+        """Login, start the stream, and launch the processing thread."""
+
+        with self._lock:
+            self._stream_status = StreamStatus.CONNECTING
+            countries = list(self._runtime_config.countries)
+            market_types = list(self._runtime_config.market_types)
+
+        if not self._betfair.is_authenticated:
+            self._betfair.login()
+
+        output_queue = self._betfair.start_stream(
+            event_type_id=self._settings.event_type_id,
+            countries=countries,
+            market_types=market_types,
+            conflate_ms=self._settings.stream_conflate_ms,
+            heartbeat_ms=self._settings.stream_heartbeat_ms,
+        )
+
+        with self._lock:
+            self._stream_status = StreamStatus.CONNECTED
+            self._processing_stop.clear()
+            self._processing_thread = threading.Thread(
+                target=self._processing_loop,
+                args=(output_queue,),
+                name="fsu100-processing",
+                daemon=True,
+            )
+            self._processing_thread.start()
+
+        self._events.publish_threadsafe(
+            "stream_connected",
+            {"countries": countries, "market_types": market_types},
+            detail=f"stream connected; {len(countries)} countries, {len(market_types)} market types",
+        )
+
+    async def _teardown_session(self, *, reason: str) -> None:
+        """Stop the stream, processing thread, and pollers, then logout."""
+
+        with self._lock:
+            self._processing_stop.set()
+            thread = self._processing_thread
+            self._processing_thread = None
+            tasks = [self._poll_orders_task, self._poll_settlement_task]
+            self._poll_orders_task = None
+            self._poll_settlement_task = None
+
+        for task in tasks:
+            if task is None:
+                continue
+            task.cancel()
+            with suppress(asyncio.CancelledError):
+                await task
+
+        self._betfair.stop_stream()
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=5.0)
+        self._betfair.logout()
+
+        with self._lock:
+            self._stream_status = StreamStatus.DISCONNECTED
+            self._market_cache.clear()
+
+        await self._events.publish(
+            "stream_disconnected",
+            {"reason": reason},
+            detail=reason,
+        )
+
+    def _start_async_pollers(self) -> None:
+        """Schedule the order and settlement polling tasks if not already running."""
+
+        loop = asyncio.get_running_loop()
+        with self._lock:
+            if self._mode is EngineMode.STOPPED:
+                return
+            if self._poll_orders_task is None or self._poll_orders_task.done():
+                self._poll_orders_task = loop.create_task(
+                    self._poll_orders(), name="fsu100-poll-orders"
+                )
+            if (
+                self._poll_settlement_task is None
+                or self._poll_settlement_task.done()
+            ):
+                self._poll_settlement_task = loop.create_task(
+                    self._poll_settlement(), name="fsu100-poll-settlement"
+                )
+
+    # ------------------------------------------------------------------
+    # Streaming & evaluation
+    # ------------------------------------------------------------------
+
+    def _processing_loop(self, output_queue: Any) -> None:
+        """Consume MarketBooks from the stream and apply the strategy."""
+
+        while not self._processing_stop.is_set():
+            try:
+                market_books = output_queue.get(timeout=1.0)
+            except Exception:
+                continue
+            try:
+                for market_book in market_books:
+                    self._handle_market_book(market_book)
+            except Exception:
+                logger.exception("processing loop raised on market_book")
+
+    def _handle_market_book(self, market_book: Any) -> None:
+        """Update the cache and, if eligible, evaluate the market."""
+
+        market_id = getattr(market_book, "market_id", None)
+        if market_id is None:
+            return
+        md = getattr(market_book, "market_definition", None)
+        publish_time = getattr(market_book, "publish_time", None)
+        in_play = bool(
+            getattr(market_book, "inplay", False)
+            or getattr(md, "in_play", False)
+        )
+
+        runner_views = self._build_runner_views(market_book)
+        market_time = getattr(md, "market_time", None) if md is not None else None
+        venue = getattr(md, "venue", None) if md is not None else None
+        country = getattr(md, "country_code", None) if md is not None else None
+        market_type = getattr(md, "market_type", None) if md is not None else None
+
+        with self._lock:
+            cache_entry = self._market_cache.get(market_id)
+            already_evaluated = bool(cache_entry and cache_entry.evaluated)
+            self._market_cache[market_id] = _MarketCacheEntry(
+                market_id=market_id,
+                venue=venue,
+                country=country,
+                market_type=market_type,
+                market_time=market_time,
+                in_play=in_play,
+                runners=runner_views,
+                last_update=datetime.now(timezone.utc),
+                evaluated=already_evaluated,
+            )
+
+        if already_evaluated:
+            return
+        if md is None or market_time is None or publish_time is None:
+            return
+        if in_play:
+            return
+
+        try:
+            plugin = self._active_plugin()
+        except PluginNotFoundError:
+            return
+        threshold = plugin.parser.time_before_off_seconds
+        seconds_to_off = (market_time - publish_time).total_seconds()
+        if seconds_to_off > threshold:
+            return
+        if seconds_to_off <= 0:
+            with self._lock:
+                entry = self._market_cache.get(market_id)
+                if entry is not None:
+                    entry.evaluated = True
+            return
+
+        with self._lock:
+            countries = tuple(self._runtime_config.countries)
+            market_types = tuple(self._runtime_config.market_types)
+            point_value = self._runtime_config.point_value
+            mode = self._mode
+            customer_strategy_ref = self._runtime_config.customer_strategy_ref
+
+        results = evaluate(
+            market_book,
+            plugin.strategy,
+            point_value=point_value,
+            filters_country=countries,
+            filters_market_type=market_types,
+        )
+        bets: list[BetDecision] = [r for r in results if isinstance(r, BetDecision)]
+        skipped: list[NoBet] = [r for r in results if isinstance(r, NoBet)]
+
+        with self._lock:
+            entry = self._market_cache.get(market_id)
+            if entry is not None:
+                entry.evaluated = True
+            self._stats.markets_processed += 1
+
+        if not bets:
+            reason = skipped[0].reason if skipped else "no_decision"
+            detail = skipped[0].detail if skipped else "evaluator returned no decisions"
+            self._events.publish_threadsafe(
+                "evaluation",
+                {
+                    "market_id": market_id,
+                    "decision": "NO_BET",
+                    "reason": reason,
+                    "detail": detail,
+                },
+                market_id=market_id,
+                detail=f"NO_BET: {reason}",
+            )
+            return
+
+        for bet in bets:
+            self._events.publish_threadsafe(
+                "evaluation",
+                {
+                    "market_id": market_id,
+                    "decision": "BET",
+                    "rule": bet.rule_applied,
+                    "selection_id": bet.selection_id,
+                    "runner_name": bet.runner_name,
+                    "side": bet.side.value,
+                    "price": bet.price,
+                    "stake": bet.stake,
+                    "liability": bet.liability,
+                    "mode": mode.value,
+                },
+                market_id=market_id,
+                detail=(
+                    f"{mode.value}: {bet.rule_applied} "
+                    f"{bet.side.value} {bet.runner_name} "
+                    f"@ {bet.price} for {bet.stake}"
+                ),
+            )
+            if mode is EngineMode.LIVE:
+                self._place_bet_sync(
+                    market_id=market_id,
+                    bet=bet,
+                    customer_strategy_ref=customer_strategy_ref,
+                )
+
+    def _build_runner_views(self, market_book: Any) -> list[RunnerSnapshot]:
+        """Construct :class:`RunnerSnapshot` rows for cache and GUI display."""
+
+        md = getattr(market_book, "market_definition", None)
+        names: dict[int, str] = {}
+        if md is not None:
+            for definition_runner in getattr(md, "runners", []) or []:
+                sid = getattr(definition_runner, "selection_id", None)
+                if sid is not None:
+                    names[int(sid)] = (
+                        getattr(definition_runner, "name", None)
+                        or f"selection_{sid}"
+                    )
+        out: list[RunnerSnapshot] = []
+        for runner in getattr(market_book, "runners", []) or []:
+            sid = getattr(runner, "selection_id", None)
+            if sid is None:
+                continue
+            sid_int = int(sid)
+            out.append(
+                RunnerSnapshot(
+                    selection_id=sid_int,
+                    name=names.get(sid_int, f"selection_{sid_int}"),
+                    status=getattr(runner, "status", None) or "ACTIVE",
+                    last_price_traded=getattr(runner, "last_price_traded", None),
+                )
+            )
+        return out
+
+    def _active_plugin(self) -> PluginConfig:
+        """Return the plugin matching the current ``runtime_config.active_plugin``."""
+
+        with self._lock:
+            name = self._runtime_config.active_plugin
+        return self._plugins.get(name)
+
+    def _resolve_default_plugin(self) -> PluginConfig:
+        """Return the default plugin configured in :class:`AppSettings`."""
+
+        try:
+            return self._plugins.get(self._settings.default_active_plugin)
+        except PluginNotFoundError:
+            available = [info.name for info in self._plugins.list()]
+            if not available:
+                raise PluginNotFoundError(
+                    "no plugins installed; cannot determine a default"
+                )
+            logger.warning(
+                "default plugin missing, falling back to first installed",
+                extra={
+                    "configured": self._settings.default_active_plugin,
+                    "fallback": available[0],
+                },
+            )
+            return self._plugins.get(available[0])
+
+    # ------------------------------------------------------------------
+    # Bet placement
+    # ------------------------------------------------------------------
+
+    def _place_bet_sync(
+        self,
+        *,
+        market_id: str,
+        bet: BetDecision,
+        customer_strategy_ref: str,
+    ) -> None:
+        """Place a bet on Betfair from the streaming thread."""
+
+        try:
+            response = self._betfair.place_lay_order(
+                market_id=market_id,
+                selection_id=bet.selection_id,
+                price=bet.price,
+                size=bet.stake,
+                customer_strategy_ref=customer_strategy_ref,
+            )
+        except BetfairServiceError as exc:
+            logger.error(
+                "place_orders failed",
+                extra={"market_id": market_id, "error": str(exc)},
+            )
+            self._events.publish_threadsafe(
+                "error",
+                {"market_id": market_id, "message": str(exc)},
+                market_id=market_id,
+                detail=f"place_orders failed: {exc}",
+            )
+            return
+
+        report = self._first_instruction_report(response)
+        bet_id = report.get("bet_id") if report else None
+        status = report.get("status") if report else None
+        if not bet_id or status != "SUCCESS":
+            logger.error(
+                "place_orders returned non-success",
+                extra={"market_id": market_id, "report": report},
+            )
+            self._events.publish_threadsafe(
+                "error",
+                {"market_id": market_id, "report": report},
+                market_id=market_id,
+                detail=f"place_orders status={status}",
+            )
+            return
+
+        order = _OpenOrder(
+            bet_id=str(bet_id),
+            market_id=market_id,
+            selection_id=bet.selection_id,
+            runner_name=bet.runner_name,
+            side=bet.side.value,
+            price=bet.price,
+            stake=bet.stake,
+            liability=bet.liability,
+            rule_applied=bet.rule_applied,
+            placed_at=datetime.now(timezone.utc),
+            matched_size=float(report.get("size_matched", 0.0) or 0.0),
+            unmatched_size=max(
+                bet.stake - float(report.get("size_matched", 0.0) or 0.0),
+                0.0,
+            ),
+        )
+        with self._lock:
+            self._open_orders[order.bet_id] = order
+            self._stats.bets_placed += 1
+            self._stats.bets_pending += 1
+            self._stats.total_stake += order.stake
+            self._stats.total_liability += order.liability
+            self._stats.open_exposure = self._compute_exposure_locked()
+
+        self._events.publish_threadsafe(
+            "bet_placed",
+            {
+                "market_id": market_id,
+                "bet_id": order.bet_id,
+                "rule": bet.rule_applied,
+                "selection_id": bet.selection_id,
+                "runner_name": bet.runner_name,
+                "side": bet.side.value,
+                "price": bet.price,
+                "stake": bet.stake,
+                "liability": bet.liability,
+            },
+            market_id=market_id,
+            detail=(
+                f"placed {bet.side.value} {bet.runner_name} @ {bet.price} "
+                f"for {bet.stake}, bet_id={order.bet_id}"
+            ),
+        )
+
+    def place_bet_external(
+        self,
+        *,
+        market_id: str,
+        decision: BetDecisionView,
+        persistence_type: str,
+        customer_order_ref: str | None,
+    ) -> Any:
+        """Place a bet requested by the AIM agent via ``POST /api/place``.
+
+        Returns the raw betfairlightweight response so the caller can map
+        instruction reports onto the API schema.
+        """
+
+        if not self._betfair.is_authenticated:
+            raise BetfairServiceError(
+                "engine is not authenticated; start LIVE or DRY_RUN mode first"
+            )
+        with self._lock:
+            mode = self._mode
+            customer_strategy_ref = self._runtime_config.customer_strategy_ref
+        if mode is not EngineMode.LIVE:
+            raise BetfairServiceError(
+                f"refusing to place bet in mode {mode.value}; switch to LIVE first"
+            )
+        response = self._betfair.place_lay_order(
+            market_id=market_id,
+            selection_id=decision.selection_id,
+            price=decision.price,
+            size=decision.stake,
+            persistence_type=persistence_type,
+            customer_strategy_ref=customer_strategy_ref,
+            customer_order_ref=customer_order_ref,
+        )
+        report = self._first_instruction_report(response)
+        bet_id = report.get("bet_id") if report else None
+        if bet_id and report and report.get("status") == "SUCCESS":
+            order = _OpenOrder(
+                bet_id=str(bet_id),
+                market_id=market_id,
+                selection_id=decision.selection_id,
+                runner_name=decision.runner_name,
+                side=decision.side,
+                price=decision.price,
+                stake=decision.stake,
+                liability=decision.liability,
+                rule_applied=decision.rule_applied,
+                placed_at=datetime.now(timezone.utc),
+                matched_size=float(report.get("size_matched", 0.0) or 0.0),
+                unmatched_size=max(
+                    decision.stake - float(report.get("size_matched", 0.0) or 0.0),
+                    0.0,
+                ),
+            )
+            with self._lock:
+                self._open_orders[order.bet_id] = order
+                self._stats.bets_placed += 1
+                self._stats.bets_pending += 1
+                self._stats.total_stake += order.stake
+                self._stats.total_liability += order.liability
+                self._stats.open_exposure = self._compute_exposure_locked()
+        return response
+
+    def cancel_bet_external(
+        self,
+        *,
+        market_id: str,
+        bet_id: str,
+        size_reduction: float | None,
+    ) -> Any:
+        """Handle ``POST /api/cancel``."""
+
+        if not self._betfair.is_authenticated:
+            raise BetfairServiceError(
+                "engine is not authenticated; start LIVE or DRY_RUN mode first"
+            )
+        return self._betfair.cancel_order(
+            market_id=market_id,
+            bet_id=bet_id,
+            size_reduction=size_reduction,
+        )
+
+    @staticmethod
+    def _first_instruction_report(response: Any) -> dict[str, Any] | None:
+        """Extract the first instruction report from a place/cancel response."""
+
+        if response is None:
+            return None
+        reports = getattr(response, "place_instruction_reports", None) or getattr(
+            response, "cancel_instruction_reports", None
+        )
+        if not reports:
+            return None
+        first = reports[0]
+        return {
+            "status": getattr(first, "status", None),
+            "bet_id": getattr(first, "bet_id", None),
+            "placed_date": getattr(first, "placed_date", None),
+            "average_price_matched": getattr(first, "average_price_matched", None),
+            "size_matched": getattr(first, "size_matched", None),
+            "size_cancelled": getattr(first, "size_cancelled", None),
+            "cancelled_date": getattr(first, "cancelled_date", None),
+            "error_code": getattr(first, "error_code", None),
+        }
+
+    def _compute_exposure_locked(self) -> float:
+        """Sum liabilities across every open order. Caller must hold the lock."""
+
+        return sum(o.liability for o in self._open_orders.values())
+
+    # ------------------------------------------------------------------
+    # Order tracking & settlement
+    # ------------------------------------------------------------------
+
+    async def _poll_orders(self) -> None:
+        """Periodic refresh of in-memory open orders from Betfair."""
+
+        interval = self._settings.order_polling_seconds
+        while True:
+            await asyncio.sleep(interval)
+            with self._lock:
+                if self._mode is EngineMode.STOPPED:
+                    return
+                strategy_ref = self._runtime_config.customer_strategy_ref
+            try:
+                report = await asyncio.to_thread(
+                    self._betfair.list_current_orders,
+                    customer_strategy_refs=[strategy_ref] if strategy_ref else None,
+                )
+            except BetfairServiceError:
+                logger.exception("list_current_orders failed; will retry")
+                self._events.publish_threadsafe(
+                    "error",
+                    {"message": "list_current_orders failed"},
+                    detail="list_current_orders failed",
+                )
+                continue
+            self._apply_orders_report(report)
+
+    def _apply_orders_report(self, report: Any) -> None:
+        """Update :attr:`_open_orders` and emit ``positions_updated``."""
+
+        if report is None:
+            return
+        with self._lock:
+            current_ids = {o.bet_id for o in self._open_orders.values()}
+            seen_ids: set[str] = set()
+            for current in getattr(report, "orders", []) or []:
+                bet_id = str(getattr(current, "bet_id", ""))
+                if not bet_id:
+                    continue
+                seen_ids.add(bet_id)
+                existing = self._open_orders.get(bet_id)
+                price_size = getattr(current, "price_size", None)
+                price = float(
+                    getattr(price_size, "price", None)
+                    or (existing.price if existing else 0.0)
+                )
+                size = float(
+                    getattr(price_size, "size", None)
+                    or (existing.stake if existing else 0.0)
+                )
+                size_matched = float(getattr(current, "size_matched", 0.0) or 0.0)
+                size_remaining = float(
+                    getattr(current, "size_remaining", size - size_matched) or 0.0
+                )
+                status = getattr(current, "status", "EXECUTABLE")
+                if status == "EXECUTION_COMPLETE" and size_remaining <= 0:
+                    if existing is not None:
+                        del self._open_orders[bet_id]
+                        if self._stats.bets_pending > 0:
+                            self._stats.bets_pending -= 1
+                    continue
+                placed_at = getattr(current, "placed_date", None) or (
+                    existing.placed_at if existing else datetime.now(timezone.utc)
+                )
+                runner_name = (
+                    existing.runner_name
+                    if existing
+                    else f"selection_{getattr(current, 'selection_id', 0)}"
+                )
+                rule_applied = existing.rule_applied if existing else None
+                liability = price * size_remaining * (price - 1.0) if price > 1.0 else 0.0
+                self._open_orders[bet_id] = _OpenOrder(
+                    bet_id=bet_id,
+                    market_id=str(getattr(current, "market_id", "")),
+                    selection_id=int(getattr(current, "selection_id", 0)),
+                    runner_name=runner_name,
+                    side=getattr(current, "side", "LAY"),
+                    price=price,
+                    stake=size,
+                    liability=existing.liability if existing else liability,
+                    rule_applied=rule_applied,
+                    placed_at=placed_at,
+                    matched_size=size_matched,
+                    unmatched_size=size_remaining,
+                )
+            for missing in current_ids - seen_ids:
+                self._open_orders.pop(missing, None)
+            self._stats.open_exposure = self._compute_exposure_locked()
+            count = len(self._open_orders)
+            exposure = self._stats.open_exposure
+
+        self._events.publish_threadsafe(
+            "positions_updated",
+            {"open_positions": count, "total_exposure": round(exposure, 2)},
+            detail=f"{count} open positions, exposure {exposure:.2f}",
+        )
+
+    async def _poll_settlement(self) -> None:
+        """Periodic pull of cleared orders, persistence, and stat updates."""
+
+        interval = self._settings.settlement_polling_seconds
+        while True:
+            await asyncio.sleep(interval)
+            with self._lock:
+                if self._mode is EngineMode.STOPPED:
+                    return
+            try:
+                today = datetime.now(timezone.utc).date()
+                bets = await asyncio.to_thread(
+                    self._fetch_cleared_bets, today, today
+                )
+            except BetfairServiceError:
+                logger.exception("list_cleared_orders failed; will retry")
+                continue
+            await self._record_settlements(bets)
+
+    def _fetch_cleared_bets(
+        self, range_start: date, range_end: date
+    ) -> list[SettledBet]:
+        """Pull cleared orders for the supplied range and convert to views."""
+
+        with self._lock:
+            strategy_ref = self._runtime_config.customer_strategy_ref
+        report = self._betfair.list_cleared_orders(
+            from_day=range_start,
+            to_day=range_end,
+            customer_strategy_refs=[strategy_ref] if strategy_ref else None,
+        )
+        return self._cleared_orders_to_views(report)
+
+    def _cleared_orders_to_views(self, report: Any) -> list[SettledBet]:
+        """Translate a betfairlightweight cleared-orders report into views."""
+
+        out: list[SettledBet] = []
+        if report is None:
+            return out
+        for order in getattr(report, "orders", []) or []:
+            bet_id = str(getattr(order, "bet_id", ""))
+            if not bet_id:
+                continue
+            with self._lock:
+                existing_open = self._open_orders.get(bet_id)
+            price = float(getattr(order, "price_matched", 0.0) or 0.0)
+            stake = float(
+                getattr(order, "size_settled", None)
+                or getattr(order, "size", None)
+                or (existing_open.stake if existing_open else 0.0)
+            )
+            profit = float(getattr(order, "profit", 0.0) or 0.0)
+            outcome = self._infer_outcome(order, profit)
+            settled_at = (
+                getattr(order, "settled_date", None)
+                or datetime.now(timezone.utc)
+            )
+            side = getattr(order, "side", "LAY")
+            liability = (
+                existing_open.liability
+                if existing_open is not None
+                else round(stake * max(price - 1.0, 0.0), 2)
+            )
+            runner_name = (
+                existing_open.runner_name
+                if existing_open is not None
+                else getattr(order, "item_description", None)
+                and getattr(order.item_description, "runner_desc", None)
+                or f"selection_{getattr(order, 'selection_id', 0)}"
+            )
+            rule_applied = (
+                existing_open.rule_applied if existing_open is not None else None
+            )
+            out.append(
+                SettledBet(
+                    bet_id=bet_id,
+                    market_id=str(getattr(order, "market_id", "")),
+                    selection_id=int(getattr(order, "selection_id", 0)),
+                    runner_name=runner_name,
+                    side=side,
+                    price=price,
+                    stake=round(stake, 2),
+                    liability=round(liability, 2),
+                    rule_applied=rule_applied,
+                    outcome=outcome,
+                    pnl=round(profit, 2),
+                    settled_at=settled_at,
+                )
+            )
+        return out
+
+    @staticmethod
+    def _infer_outcome(order: Any, profit: float) -> str:
+        """Infer ``WON`` / ``LOST`` / ``VOID`` from a cleared order."""
+
+        if getattr(order, "size_cancelled", 0):
+            return "VOID"
+        if profit > 0:
+            return "WON"
+        if profit < 0:
+            return "LOST"
+        return "VOID"
+
+    async def _record_settlements(self, bets: Iterable[SettledBet]) -> None:
+        """Update stats, drop matching open orders, and persist to GCS."""
+
+        new_records: list[_SettledBetRecord] = []
+        with self._lock:
+            for bet in bets:
+                if bet.bet_id in self._known_settled_bet_ids:
+                    continue
+                self._known_settled_bet_ids.add(bet.bet_id)
+                record = _SettledBetRecord(
+                    bet_id=bet.bet_id,
+                    market_id=bet.market_id,
+                    selection_id=bet.selection_id,
+                    runner_name=bet.runner_name,
+                    side=bet.side,
+                    price=bet.price,
+                    stake=bet.stake,
+                    liability=bet.liability,
+                    rule_applied=bet.rule_applied,
+                    outcome=bet.outcome,
+                    pnl=bet.pnl,
+                    settled_at=bet.settled_at,
+                )
+                new_records.append(record)
+                self._recent_settled.insert(0, record)
+                if len(self._recent_settled) > self._MAX_RECENT_SETTLED:
+                    del self._recent_settled[self._MAX_RECENT_SETTLED :]
+                if record.outcome == "WON":
+                    self._stats.bets_won += 1
+                elif record.outcome == "LOST":
+                    self._stats.bets_lost += 1
+                else:
+                    self._stats.bets_void += 1
+                if self._stats.bets_pending > 0:
+                    self._stats.bets_pending -= 1
+                self._stats.total_pnl += record.pnl
+                self._open_orders.pop(record.bet_id, None)
+            self._stats.open_exposure = self._compute_exposure_locked()
+
+        if not new_records:
+            return
+
+        bucket = self._runtime_config.results_bucket
+        for record in new_records:
+            await self._persist_settled_bet(bucket, record)
+            await self._events.publish(
+                "bet_settled",
+                {
+                    "bet_id": record.bet_id,
+                    "market_id": record.market_id,
+                    "outcome": record.outcome,
+                    "pnl": record.pnl,
+                },
+                market_id=record.market_id,
+                detail=(
+                    f"{record.outcome} {record.runner_name} pnl={record.pnl}"
+                ),
+            )
+
+        await self._publish_daily_summary(bucket)
+
+    async def _persist_settled_bet(
+        self, bucket: str, record: _SettledBetRecord
+    ) -> None:
+        day = record.settled_at.astimezone(timezone.utc).date()
+        blob_name = self._gcs.settled_blob_name(day)
+        line = json.dumps(record.to_view().model_dump(mode="json"))
+        try:
+            await asyncio.to_thread(
+                self._gcs.append_jsonl, bucket, blob_name, line
+            )
+        except RuntimeError:
+            logger.exception(
+                "failed to append settled bet to GCS",
+                extra={"bucket": bucket, "blob_name": blob_name},
+            )
+
+    async def _publish_daily_summary(self, bucket: str) -> None:
+        """Mirror today's stats to ``summary/<date>.json`` for portal consumption."""
+
+        today = datetime.now(timezone.utc).date()
+        snapshot = self.stats().model_dump(mode="json")
+        blob_name = self._gcs.daily_summary_blob_name(today)
+        try:
+            await asyncio.to_thread(
+                self._gcs.upload_text,
+                bucket,
+                blob_name,
+                json.dumps(snapshot, separators=(",", ":")),
+            )
+        except RuntimeError:
+            logger.exception(
+                "failed to publish daily summary",
+                extra={"bucket": bucket, "blob_name": blob_name},
+            )
+
+    # ------------------------------------------------------------------
+    # Stateless helpers used by /api/evaluate
+    # ------------------------------------------------------------------
+
+    def evaluate_snapshot(
+        self,
+        snapshot: Any,
+        plugin: PluginConfig,
+        *,
+        point_value_override: float | None = None,
+    ) -> tuple[list[BetDecision], list[NoBet]]:
+        """Run the evaluator against a caller-supplied market snapshot.
+
+        Pure delegation to :func:`evaluator.evaluate` — kept on the engine
+        so the FastAPI layer doesn't import the evaluator directly and so
+        a future change to defaults flows through one entry point.
+        """
+
+        point_value = (
+            point_value_override
+            if point_value_override is not None
+            else plugin.staking.point_value
+        )
+        results = evaluate(
+            snapshot,
+            plugin.strategy,
+            point_value=point_value,
+            filters_country=plugin.source.filters.countries,
+            filters_market_type=plugin.source.filters.market_types,
+        )
+        bets = [r for r in results if isinstance(r, BetDecision)]
+        skipped = [r for r in results if isinstance(r, NoBet)]
+        return bets, skipped
+
+
+_ENGINE: LiveEngine | None = None
+
+
+def get_engine() -> LiveEngine:
+    """Return the lazily-created singleton engine instance.
+
+    Created during the FastAPI lifespan via :func:`create_engine`. Calling
+    this before lifespan startup is a programming error.
+    """
+
+    if _ENGINE is None:
+        raise RuntimeError("engine has not been created yet")
+    return _ENGINE
+
+
+def create_engine(
+    *,
+    settings: AppSettings,
+    plugins: PluginStore,
+    betfair: BetfairService,
+    gcs: GcsService,
+    events: EventBus,
+) -> LiveEngine:
+    """Create and register the process-wide :class:`LiveEngine`."""
+
+    global _ENGINE
+    _ENGINE = LiveEngine(
+        settings=settings,
+        plugins=plugins,
+        betfair=betfair,
+        gcs=gcs,
+        events=events,
+    )
+    return _ENGINE
+
+
+__all__ = [
+    "EngineRuntimeConfig",
+    "LiveEngine",
+    "create_engine",
+    "get_engine",
+]
