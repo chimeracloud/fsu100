@@ -19,7 +19,7 @@ COPY requirements.txt ./
 RUN pip install --upgrade pip \
     && pip install -r requirements.txt
 
-COPY main.py evaluator.py ./
+COPY main.py engine.py evaluator.py ./
 COPY models/ ./models/
 COPY services/ ./services/
 COPY core/ ./core/
