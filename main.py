@@ -29,6 +29,7 @@ from datetime import date, datetime, timezone
 from typing import Any, AsyncIterator
 
 from fastapi import Depends, FastAPI, HTTPException, Path as FastApiPath, Query
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import ValidationError
 from sse_starlette.sse import EventSourceResponse
@@ -136,6 +137,14 @@ app = FastAPI(
         "DRY_RUN via /admin/control."
     ),
     lifespan=_lifespan,
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=get_settings().cors_allowed_origins,
+    allow_credentials=True,
+    allow_methods=["GET", "POST", "PUT", "OPTIONS"],
+    allow_headers=["*"],
 )
 
 
