@@ -390,6 +390,30 @@ class ActivityResponse(_Strict):
     events: list[ActivityEvent]
 
 
+class CredentialSecretStatus(_Strict):
+    """One required secret's current status. Status only — never values."""
+
+    secret_id: str
+    configured: bool
+    error: str | None = None
+
+
+class CredentialStatusResponse(_Strict):
+    """Body of ``GET /admin/credentials/status``.
+
+    Reports whether the engine's bound credential bundle is fully provisioned
+    in Secret Manager. The bundle is identified by ``bundle_name`` (per-engine
+    /per-sport, e.g. ``betfair-lay-fsu100-creds``); the secrets array shows
+    each required secret's reachability without ever surfacing the value.
+    """
+
+    bundle_name: str
+    project: str
+    configured: bool
+    secrets: list[CredentialSecretStatus]
+    retrieved_at: datetime
+
+
 # ---------------------------------------------------------------------------
 # GUI / portal-facing (Set 2)
 # ---------------------------------------------------------------------------

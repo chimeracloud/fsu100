@@ -55,6 +55,8 @@ from models.schemas import (
     CancelResponse,
     ControlAction,
     ControlResponse,
+    CredentialSecretStatus,
+    CredentialStatusResponse,
     EvaluateRequest,
     EvaluateResponse,
     HistoryResponse,
@@ -235,6 +237,43 @@ async def admin_stats(
     """Return the rolling stats counter."""
 
     return engine.stats()
+
+
+@app.get(
+    "/admin/credentials/status",
+    response_model=CredentialStatusResponse,
+    tags=["admin"],
+    summary="Per-engine credential bundle status (no values surfaced).",
+)
+async def admin_credentials_status(
+    settings: AppSettings = Depends(_settings_dep),
+) -> CredentialStatusResponse:
+    """Return whether the engine's Secret Manager bundle is fully provisioned.
+
+    Reads `secretmanager.versions.access` per required secret. Engine's
+    bundle name is derived from ``customer_strategy_ref`` (per-engine,
+    per-sport). Future: a config-driven explicit bundle name.
+    """
+
+    from services.secrets_service import SecretsService
+
+    service = SecretsService()
+    report = await asyncio.to_thread(service.credential_status)
+    bundle_name = f"betfair-{settings.customer_strategy_ref}-creds"
+    return CredentialStatusResponse(
+        bundle_name=bundle_name,
+        project=str(report.get("project", settings.gcp_project)),
+        configured=bool(report.get("configured", False)),
+        secrets=[
+            CredentialSecretStatus(
+                secret_id=str(s.get("secret_id", "")),
+                configured=bool(s.get("configured", False)),
+                error=(str(s["error"]) if s.get("error") else None),
+            )
+            for s in report.get("secrets", [])
+        ],
+        retrieved_at=datetime.now(timezone.utc),
+    )
 
 
 @app.get(
