@@ -357,6 +357,23 @@ class AdminConfig(_Strict):
         max_length=15,
         description="String tagged onto every order for back-office tracking.",
     )
+    daily_max_stake_enabled: bool = Field(
+        default=False,
+        description=(
+            "When true, the engine refuses any bet that would push the "
+            "session cumulative stake above ``daily_max_stake``. Stats are "
+            "auto-reset at midnight UTC by the engine."
+        ),
+    )
+    daily_max_stake: float = Field(
+        default=0.0,
+        ge=0,
+        description=(
+            "Hard ceiling on cumulative stake placed by the engine in a "
+            "single trading day, in £. Ignored when "
+            "``daily_max_stake_enabled`` is False."
+        ),
+    )
 
 
 class AdminStats(_Strict):

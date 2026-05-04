@@ -83,6 +83,8 @@ class EngineRuntimeConfig:
     market_types: list[str]
     point_value: float
     customer_strategy_ref: str
+    daily_max_stake_enabled: bool = False
+    daily_max_stake: float = 0.0
 
     def to_admin_config(self) -> AdminConfig:
         """Produce the :class:`AdminConfig` view served by the admin API."""
@@ -96,6 +98,8 @@ class EngineRuntimeConfig:
             market_types=list(self.market_types),
             point_value=self.point_value,
             customer_strategy_ref=self.customer_strategy_ref,
+            daily_max_stake_enabled=self.daily_max_stake_enabled,
+            daily_max_stake=self.daily_max_stake,
         )
 
 
@@ -246,6 +250,8 @@ class LiveEngine:
             market_types=list(default_plugin.source.filters.market_types),
             point_value=default_plugin.staking.point_value,
             customer_strategy_ref=settings.customer_strategy_ref,
+            daily_max_stake_enabled=False,
+            daily_max_stake=0.0,
         )
 
         self._market_cache: dict[str, _MarketCacheEntry] = {}
@@ -258,6 +264,7 @@ class LiveEngine:
         self._processing_stop = threading.Event()
         self._poll_orders_task: asyncio.Task[None] | None = None
         self._poll_settlement_task: asyncio.Task[None] | None = None
+        self._daily_reset_task: asyncio.Task[None] | None = None
 
     # ------------------------------------------------------------------
     # Status accessors
@@ -313,6 +320,8 @@ class LiveEngine:
                     payload.customer_strategy_ref
                     or self._settings.customer_strategy_ref
                 ),
+                daily_max_stake_enabled=payload.daily_max_stake_enabled,
+                daily_max_stake=payload.daily_max_stake,
             )
             return self._runtime_config.to_admin_config()
 
@@ -645,9 +654,10 @@ class LiveEngine:
             self._processing_stop.set()
             thread = self._processing_thread
             self._processing_thread = None
-            tasks = [self._poll_orders_task, self._poll_settlement_task]
+            tasks = [self._poll_orders_task, self._poll_settlement_task, self._daily_reset_task]
             self._poll_orders_task = None
             self._poll_settlement_task = None
+            self._daily_reset_task = None
 
         for task in tasks:
             if task is None:
@@ -689,6 +699,37 @@ class LiveEngine:
                 self._poll_settlement_task = loop.create_task(
                     self._poll_settlement(), name="fsu100-poll-settlement"
                 )
+            if self._daily_reset_task is None or self._daily_reset_task.done():
+                self._daily_reset_task = loop.create_task(
+                    self._daily_reset_loop(), name="fsu100-daily-reset"
+                )
+
+    async def _daily_reset_loop(self) -> None:
+        """Auto-reset stats at midnight UTC so the daily cap resets cleanly.
+
+        The daily spend cap is enforced against ``stats.total_stake`` —
+        without this loop, the counter would accumulate indefinitely and
+        the cap would behave like a session cap rather than a daily one.
+        """
+
+        from datetime import timedelta as _td  # noqa: PLC0415 — local to keep top of file tidy
+        while True:
+            now = datetime.now(timezone.utc)
+            tomorrow = (now + _td(days=1)).replace(
+                hour=0, minute=0, second=0, microsecond=0
+            )
+            await asyncio.sleep((tomorrow - now).total_seconds())
+            with self._lock:
+                if self._mode is EngineMode.STOPPED:
+                    return
+                self._stats.reset()
+                self._recent_settled.clear()
+                self._known_settled_bet_ids.clear()
+            await self._events.publish(
+                "stats_reset",
+                {"trigger": "daily-midnight-utc"},
+                detail="stats auto-reset at midnight UTC",
+            )
 
     # ------------------------------------------------------------------
     # Streaming & evaluation
@@ -923,6 +964,28 @@ class LiveEngine:
     # Bet placement
     # ------------------------------------------------------------------
 
+    def _check_daily_cap(self, stake: float) -> str | None:
+        """Return ``None`` if ``stake`` is OK, else a human-readable reason.
+
+        Compares cumulative stake (today's session) + the proposed stake
+        against ``daily_max_stake`` from runtime config. Reset at midnight
+        UTC by :meth:`_daily_reset_loop`.
+        """
+
+        with self._lock:
+            if not self._runtime_config.daily_max_stake_enabled:
+                return None
+            cap = float(self._runtime_config.daily_max_stake or 0.0)
+            if cap <= 0:
+                return None
+            already = float(self._stats.total_stake)
+        if already + stake > cap:
+            return (
+                f"daily spend cap £{cap:.2f} would be exceeded — "
+                f"already £{already:.2f} placed; bet stake £{stake:.2f}"
+            )
+        return None
+
     def _place_bet_sync(
         self,
         *,
@@ -931,6 +994,20 @@ class LiveEngine:
         customer_strategy_ref: str,
     ) -> None:
         """Place a bet on Betfair from the streaming thread."""
+
+        cap_block = self._check_daily_cap(bet.stake)
+        if cap_block is not None:
+            logger.warning(
+                "bet refused by daily spend cap",
+                extra={"market_id": market_id, "reason": cap_block},
+            )
+            self._events.publish_threadsafe(
+                "spend_cap_blocked",
+                {"market_id": market_id, "stake": bet.stake, "reason": cap_block},
+                market_id=market_id,
+                detail=cap_block,
+            )
+            return
 
         try:
             response = self._betfair.place_lay_order(
@@ -1039,6 +1116,9 @@ class LiveEngine:
             raise BetfairServiceError(
                 f"refusing to place bet in mode {mode.value}; switch to LIVE first"
             )
+        cap_block = self._check_daily_cap(decision.stake)
+        if cap_block is not None:
+            raise BetfairServiceError(cap_block)
         response = self._betfair.place_lay_order(
             market_id=market_id,
             selection_id=decision.selection_id,
