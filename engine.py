@@ -1020,8 +1020,23 @@ class LiveEngine:
 
         Extracts the full per-runner price set the portal needs — last
         traded, best back / lay (top of book), and SP projected / actual.
-        Missing fields are left as ``None`` rather than raising.
+        Missing fields are left as ``None`` rather than raising. Betfair
+        emits ``nan`` (not ``None``) for SP fields with no projection
+        yet, which the standard JSON encoder rejects; the helper below
+        coerces both ``nan`` and ``inf`` to ``None`` so the API response
+        always serialises.
         """
+
+        def _safe(v: Any) -> float | None:
+            if v is None:
+                return None
+            try:
+                f = float(v)
+            except (TypeError, ValueError):
+                return None
+            if f != f or f in (float("inf"), float("-inf")):
+                return None
+            return f
 
         md = getattr(market_book, "market_definition", None)
         names: dict[int, str] = {}
@@ -1065,12 +1080,12 @@ class LiveEngine:
                     selection_id=sid_int,
                     name=names.get(sid_int, f"selection_{sid_int}"),
                     status=getattr(runner, "status", None) or "ACTIVE",
-                    last_price_traded=getattr(runner, "last_price_traded", None),
-                    best_back=float(best_back) if best_back is not None else None,
-                    best_lay=float(best_lay) if best_lay is not None else None,
-                    near_price=float(near_price) if near_price is not None else None,
-                    far_price=float(far_price) if far_price is not None else None,
-                    actual_sp=float(actual_sp) if actual_sp is not None else None,
+                    last_price_traded=_safe(getattr(runner, "last_price_traded", None)),
+                    best_back=_safe(best_back),
+                    best_lay=_safe(best_lay),
+                    near_price=_safe(near_price),
+                    far_price=_safe(far_price),
+                    actual_sp=_safe(actual_sp),
                 )
             )
         return out
