@@ -511,6 +511,62 @@ class LiveEngine:
     async def stop(self) -> AdminStatus:
         return await self._transition_to(EngineMode.STOPPED)
 
+    async def emergency_stop(self) -> dict[str, Any]:
+        """Kill switch — cancel every open order, then stop the stream.
+
+        Distinct from :meth:`stop` (orderly): this issues a platform-wide
+        cancel on Betfair *before* tearing the session down so unmatched
+        orders can't lapse to fill while we're shutting down. Safe to
+        call from any mode. Returns a small report so the caller can
+        surface what was actioned.
+        """
+
+        with self._lock:
+            previous_mode = self._mode
+
+        cancel_report: dict[str, Any] = {"attempted": False}
+        if self._betfair.is_authenticated:
+            try:
+                response = await asyncio.to_thread(
+                    self._betfair.cancel_all_orders
+                )
+                reports = (
+                    getattr(response, "cancel_instruction_reports", None) or []
+                )
+                cancel_report = {
+                    "attempted": True,
+                    "status": getattr(response, "status", None),
+                    "instruction_count": len(reports),
+                    "error_code": getattr(response, "error_code", None),
+                }
+            except BetfairServiceError as exc:
+                logger.exception("emergency_stop: cancel_all_orders raised")
+                cancel_report = {
+                    "attempted": True,
+                    "status": "FAILURE",
+                    "error_code": str(exc),
+                }
+
+        await self._teardown_session(reason="emergency stop")
+
+        with self._lock:
+            self._mode = EngineMode.STOPPED
+
+        await self._events.publish(
+            "emergency_stop",
+            {"previous_mode": previous_mode.value, "cancel_report": cancel_report},
+            detail=(
+                f"EMERGENCY STOP from {previous_mode.value}: "
+                f"cancel status={cancel_report.get('status', 'n/a')}"
+            ),
+        )
+
+        return {
+            "previous_mode": previous_mode.value,
+            "cancel_report": cancel_report,
+            "status": self.status().model_dump(mode="json"),
+        }
+
     async def _transition_to(self, target: EngineMode) -> AdminStatus:
         with self._lock:
             current = self._mode

@@ -293,6 +293,7 @@ class ControlAction(str, Enum):
     STOP = "stop"
     DRY_RUN = "dry-run"
     RESET_STATS = "reset-stats"
+    EMERGENCY_STOP = "emergency-stop"
 
 
 class ControlResponse(_Strict):

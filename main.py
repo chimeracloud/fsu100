@@ -320,6 +320,22 @@ async def admin_control(
     """Apply a one-shot control action and return the resulting mode."""
 
     try:
+        if action is ControlAction.EMERGENCY_STOP:
+            report = await engine.emergency_stop()
+            await bus.publish(
+                "stats_reset",
+                {},
+                detail="EMERGENCY STOP triggered by operator",
+            )
+            cancel_status = report.get("cancel_report", {}).get("status") or "n/a"
+            return ControlResponse(
+                action=action,
+                accepted=True,
+                mode=engine.status().mode,
+                detail=(
+                    f"emergency stop completed; cancel_orders status={cancel_status}"
+                ),
+            )
         if action is ControlAction.START:
             status = await engine.start_live()
             return ControlResponse(

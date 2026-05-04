@@ -307,6 +307,23 @@ class BetfairService:
                 f"place_orders failed for market {market_id}: {exc}"
             ) from exc
 
+    def cancel_all_orders(self, customer_ref: str | None = None) -> Any:
+        """Cancel every open bet across every market.
+
+        ``trading.betting.cancel_orders()`` with no market_id and no
+        instructions issues a platform-wide cancel — the kill-switch
+        primitive. Returns the betfairlightweight CancelOrders response
+        so the caller can audit what was actioned.
+        """
+
+        trading = self._require_trading()
+        try:
+            return trading.betting.cancel_orders(customer_ref=customer_ref)
+        except BetfairError as exc:
+            raise BetfairServiceError(
+                f"cancel_all_orders failed: {exc}"
+            ) from exc
+
     def cancel_order(
         self,
         *,
