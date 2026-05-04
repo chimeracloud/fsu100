@@ -57,6 +57,9 @@ from models.schemas import (
     ControlResponse,
     CredentialSecretStatus,
     CredentialStatusResponse,
+    VariablePatchAudit,
+    VariablePatchRequest,
+    VariablePatchResponse,
     EvaluateRequest,
     EvaluateResponse,
     HistoryResponse,
@@ -479,6 +482,43 @@ async def get_strategy_schema(
             status_code=404,
             detail=f"plugin '{name}' not installed",
         ) from exc
+
+
+@app.post(
+    "/api/strategies/{name}/variables",
+    response_model=VariablePatchResponse,
+    tags=["gui"],
+    summary="Tune plugin variable values (mode-locked, audited).",
+)
+async def post_strategy_variables(
+    name: str,
+    payload: VariablePatchRequest,
+    engine: LiveEngine = Depends(_engine_dep),
+) -> VariablePatchResponse:
+    """Apply per-variable patches to a plugin's values.
+
+    Mode-locked: 409 if engine is not ``STOPPED``. Patches are validated
+    against ``_meta`` bounds when declared on the plugin. Successful
+    changes are audited to GCS and broadcast as a
+    ``plugin_variables_applied`` SSE event.
+    """
+
+    try:
+        result = await engine.apply_variable_patches(
+            name, payload.variables, actor=payload.actor
+        )
+    except PermissionError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except PluginNotFoundError as exc:
+        raise HTTPException(
+            status_code=404, detail=f"plugin '{name}' not installed"
+        ) from exc
+
+    return VariablePatchResponse(
+        plugin=result["plugin"],
+        applied=[VariablePatchAudit(**row) for row in result["applied"]],
+        rejected=result["rejected"],
+    )
 
 
 @app.get(

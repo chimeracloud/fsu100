@@ -414,6 +414,50 @@ class CredentialStatusResponse(_Strict):
     retrieved_at: datetime
 
 
+class VariablePatchRequest(_Strict):
+    """Body of ``POST /api/strategies/{name}/variables``.
+
+    ``variables`` is a flat map of dotted paths → new values, matching the
+    ``fieldKey`` shape the PluginCard already produces:
+
+    * ``rule_2b.base_stake``     → strategy.rules[name=rule_2b].base_stake
+    * ``controls.jofs_spread``   → strategy.controls.jofs_spread
+    * ``staking.point_value``    → staking.point_value
+
+    Only *values* can be tuned this way — adding/removing rules or
+    changing odds bands belongs in the Configurator (the strategy
+    *shape* surface). The engine validates each value against the
+    plugin's ``_meta`` bounds (when declared) before applying.
+    """
+
+    variables: dict[str, Any]
+    actor: str | None = Field(
+        default=None,
+        max_length=64,
+        description="Operator identifier persisted to the audit log.",
+    )
+
+
+class VariablePatchAudit(_Strict):
+    """One row of the audit trail for a variable change."""
+
+    timestamp: datetime
+    plugin_name: str
+    plugin_version: str
+    actor: str | None
+    path: str
+    before: Any
+    after: Any
+
+
+class VariablePatchResponse(_Strict):
+    """Response for ``POST /api/strategies/{name}/variables``."""
+
+    plugin: dict[str, Any]
+    applied: list[VariablePatchAudit]
+    rejected: dict[str, str] = Field(default_factory=dict)
+
+
 # ---------------------------------------------------------------------------
 # GUI / portal-facing (Set 2)
 # ---------------------------------------------------------------------------

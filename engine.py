@@ -1367,6 +1367,211 @@ class LiveEngine:
             )
 
     # ------------------------------------------------------------------
+    # Per-variable APPLY (Lay Engine PluginCard wiring)
+    # ------------------------------------------------------------------
+
+    async def apply_variable_patches(
+        self,
+        plugin_name: str,
+        variables: dict[str, Any],
+        *,
+        actor: str | None = None,
+    ) -> dict[str, Any]:
+        """Apply a flat map of dotted-path → value patches to a plugin.
+
+        Mode-locked: engine must be ``STOPPED``. Patches are validated
+        against ``_meta`` bounds (when declared) before being applied. The
+        plugin object held in :class:`PluginStore` is mutated in place,
+        the full updated plugin is mirrored to GCS at
+        ``overrides/<plugin>.json``, and one audit row per applied change
+        is appended to ``audit/<YYYY-MM-DD>.jsonl``. An SSE
+        ``plugin_variables_applied`` event fires on success.
+
+        Returns:
+            ``{"plugin": <updated plugin dict>, "applied": [...], "rejected": {...}}``
+            — ``applied`` lists the audit rows for accepted changes;
+            ``rejected`` maps path → reason for any patch we declined.
+        """
+
+        with self._lock:
+            mode = self._mode
+        if mode is not EngineMode.STOPPED:
+            raise PermissionError(
+                f"engine must be STOPPED to apply variable patches; current mode={mode.value}"
+            )
+
+        try:
+            plugin = self._plugins.get(plugin_name)
+        except PluginNotFoundError:
+            raise
+
+        applied: list[dict[str, Any]] = []
+        rejected: dict[str, str] = {}
+        now = datetime.now(timezone.utc)
+
+        for path, value in variables.items():
+            try:
+                before, after = self._apply_single_patch(plugin, path, value)
+            except (KeyError, TypeError, ValueError) as exc:
+                rejected[path] = f"{type(exc).__name__}: {exc}"
+                continue
+            applied.append(
+                {
+                    "timestamp": now.isoformat(),
+                    "plugin_name": plugin.name,
+                    "plugin_version": plugin.version,
+                    "actor": actor,
+                    "path": path,
+                    "before": before,
+                    "after": after,
+                }
+            )
+
+        if applied:
+            await self._persist_plugin_overrides(plugin)
+            await self._persist_audit_rows(applied)
+            await self._events.publish(
+                "plugin_variables_applied",
+                {
+                    "plugin_name": plugin.name,
+                    "plugin_version": plugin.version,
+                    "applied": applied,
+                    "actor": actor,
+                },
+                detail=(
+                    f"{len(applied)} variable patch(es) applied to "
+                    f"{plugin.name} by {actor or 'operator'}"
+                ),
+            )
+
+        return {
+            "plugin": plugin.model_dump(mode="json"),
+            "applied": applied,
+            "rejected": rejected,
+        }
+
+    def _apply_single_patch(
+        self, plugin: PluginConfig, path: str, value: Any
+    ) -> tuple[Any, Any]:
+        """Mutate ``plugin`` at ``path`` and return ``(before, after)``.
+
+        Path forms accepted:
+            * ``<rule_name>.<field>``       — e.g. ``rule_2b.base_stake``
+            * ``controls.<field>``          — e.g. ``controls.jofs_spread``
+            * ``staking.<field>``           — e.g. ``staking.point_value``
+
+        Bounds are checked against the matching ``_meta`` block when
+        declared on the plugin; out-of-bounds values raise ``ValueError``.
+        """
+
+        parts = path.split(".")
+        if len(parts) != 2:
+            raise ValueError(f"unsupported path '{path}'")
+        head, field = parts
+
+        if head == "controls":
+            target = plugin.strategy.controls
+            meta = getattr(target, "_meta", None) or {}
+        elif head == "staking":
+            target = plugin.staking
+            meta = getattr(target, "_meta", None) or {}
+        else:
+            target = next(
+                (r for r in plugin.strategy.rules if r.name == head), None
+            )
+            if target is None:
+                raise KeyError(f"unknown rule '{head}'")
+            meta = getattr(target, "_meta", None) or {}
+
+        if not hasattr(target, field):
+            raise KeyError(f"unknown field '{field}' on '{head}'")
+
+        coerced = self._coerce_with_meta(value, meta.get(field))
+        before = getattr(target, field, None)
+        try:
+            setattr(target, field, coerced)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"could not assign {coerced!r} to {path}: {exc}") from exc
+        return before, coerced
+
+    @staticmethod
+    def _coerce_with_meta(value: Any, meta: Any) -> Any:
+        """Coerce ``value`` to the right primitive and check bounds.
+
+        ``meta`` is the per-field ``_meta`` block from the plugin
+        (``{"min": 0, "max": 5, "step": 0.5, "default": 1}`` or similar).
+        Booleans pass through. Numerics are coerced to float and bounded
+        if min/max are declared.
+        """
+
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float)):
+            num = float(value)
+        elif isinstance(value, str):
+            try:
+                num = float(value)
+            except ValueError:
+                return value
+        else:
+            return value
+        if meta:
+            if "min" in meta and num < float(meta["min"]):
+                raise ValueError(
+                    f"value {num} below declared min {meta['min']}"
+                )
+            if "max" in meta and num > float(meta["max"]):
+                raise ValueError(
+                    f"value {num} above declared max {meta['max']}"
+                )
+        return num
+
+    async def _persist_plugin_overrides(self, plugin: PluginConfig) -> None:
+        """Mirror the full updated plugin to GCS under ``overrides/<name>.json``.
+
+        Allows future container restarts to rehydrate operator tunings.
+        Hydration on startup is a follow-up — the file is written today
+        so it can be consumed when that lands.
+        """
+
+        bucket = self._runtime_config.results_bucket
+        blob_name = f"overrides/{plugin.name}.json"
+        payload = json.dumps(plugin.model_dump(mode="json"), indent=2)
+        try:
+            await asyncio.to_thread(
+                self._gcs.upload_text, bucket, blob_name, payload
+            )
+        except RuntimeError:
+            logger.exception(
+                "failed to persist plugin overrides",
+                extra={"bucket": bucket, "blob_name": blob_name},
+            )
+
+    async def _persist_audit_rows(
+        self, rows: list[dict[str, Any]]
+    ) -> None:
+        """Append audit rows to today's JSONL log in the results bucket."""
+
+        if not rows:
+            return
+        bucket = self._runtime_config.results_bucket
+        today = datetime.now(timezone.utc).date()
+        blob_name = f"audit/{today.isoformat()}.jsonl"
+        for row in rows:
+            try:
+                await asyncio.to_thread(
+                    self._gcs.append_jsonl,
+                    bucket,
+                    blob_name,
+                    json.dumps(row),
+                )
+            except RuntimeError:
+                logger.exception(
+                    "failed to append audit row",
+                    extra={"bucket": bucket, "blob_name": blob_name},
+                )
+
+    # ------------------------------------------------------------------
     # Stateless helpers used by /api/evaluate
     # ------------------------------------------------------------------
 
