@@ -1370,6 +1370,53 @@ class LiveEngine:
     # Per-variable APPLY (Lay Engine PluginCard wiring)
     # ------------------------------------------------------------------
 
+    async def hydrate_overrides_from_gcs(self) -> dict[str, int]:
+        """Replace any installed plugin with its GCS-mirrored override.
+
+        Called from the FastAPI lifespan after the plugin store loads from
+        disk. For each plugin we attempt to read
+        ``overrides/<plugin_name>.json`` from the results bucket; if
+        present and valid, we replace the in-memory ``PluginConfig`` with
+        the persisted one. This is what makes operator tunings survive
+        container restarts.
+
+        Returns a small report mapping plugin name → field count of the
+        loaded override (for logging).
+        """
+
+        bucket = self._runtime_config.results_bucket
+        report: dict[str, int] = {}
+        for info in self._plugins.list():
+            blob_name = f"overrides/{info.name}.json"
+            try:
+                text = await asyncio.to_thread(
+                    self._gcs.download_text, bucket, blob_name
+                )
+            except RuntimeError:
+                logger.warning(
+                    "could not fetch plugin override (permission?)",
+                    extra={"bucket": bucket, "blob_name": blob_name},
+                )
+                continue
+            if not text:
+                continue
+            try:
+                payload = json.loads(text)
+                hydrated = PluginConfig.model_validate(payload)
+            except Exception:
+                logger.exception(
+                    "plugin override on GCS failed validation; ignoring",
+                    extra={"plugin": info.name},
+                )
+                continue
+            self._plugins._plugins[info.name] = hydrated  # noqa: SLF001 — controlled mutation
+            report[info.name] = sum(1 for _ in payload.get("strategy", {}).get("rules", []))
+            logger.info(
+                "plugin override hydrated from GCS",
+                extra={"plugin": info.name, "rules": report[info.name]},
+            )
+        return report
+
     async def apply_variable_patches(
         self,
         plugin_name: str,

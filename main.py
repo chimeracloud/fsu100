@@ -111,6 +111,18 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.gcs = gcs
     app.state.engine = engine
 
+    # Rehydrate any plugin override the operator persisted in a previous
+    # session so variable tunings survive container restarts.
+    try:
+        hydrated = await engine.hydrate_overrides_from_gcs()
+        if hydrated:
+            logger.info(
+                "rehydrated plugin overrides from GCS",
+                extra={"plugins": list(hydrated.keys())},
+            )
+    except Exception:  # noqa: BLE001 — startup must not fail because of overrides
+        logger.exception("plugin override hydration raised; continuing with disk plugins")
+
     logger.info(
         "fsu100 service started in STOPPED mode",
         extra={
