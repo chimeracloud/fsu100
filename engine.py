@@ -414,22 +414,31 @@ class LiveEngine:
     # ------------------------------------------------------------------
 
     def markets(self) -> MarketsResponse:
-        """Return the snapshot served by ``GET /api/markets``."""
+        """Return the snapshot served by ``GET /api/markets``.
+
+        ``market_time`` arrives from betfairlightweight as a naive UTC
+        datetime; ``now`` is timezone-aware. Coercing both to aware UTC
+        before subtraction prevents ``TypeError: can't subtract
+        offset-naive and offset-aware datetimes``.
+        """
 
         now = datetime.now(timezone.utc)
         out: list[MarketView] = []
         with self._lock:
             for entry in self._market_cache.values():
                 seconds_to_off: float | None = None
-                if entry.market_time is not None:
-                    seconds_to_off = (entry.market_time - now).total_seconds()
+                market_time = entry.market_time
+                if market_time is not None:
+                    if market_time.tzinfo is None:
+                        market_time = market_time.replace(tzinfo=timezone.utc)
+                    seconds_to_off = (market_time - now).total_seconds()
                 out.append(
                     MarketView(
                         market_id=entry.market_id,
                         venue=entry.venue,
                         country=entry.country,
                         market_type=entry.market_type,
-                        market_time=entry.market_time,
+                        market_time=market_time,
                         seconds_to_off=seconds_to_off,
                         in_play=entry.in_play,
                         evaluated=entry.evaluated,
