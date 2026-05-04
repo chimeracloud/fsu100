@@ -549,13 +549,32 @@ class VariablePatchResponse(_Strict):
 # ---------------------------------------------------------------------------
 
 
+class PriceSize(_Strict):
+    """One ``(price, size)`` rung of the back or lay ladder.
+
+    ``size`` is the total amount currently available at that price, in
+    account currency units (typically £). ``None`` for either field
+    means Betfair did not report a value (rare for live markets).
+    """
+
+    price: float | None = None
+    size: float | None = None
+
+
 class RunnerSnapshot(_Strict):
     """One runner row inside :class:`MarketSnapshot` and :class:`MarketView`.
 
-    Carries every price the portal needs in a single object — last traded
-    price, best back / lay (from ``EX_BEST_OFFERS``) and SP near / far /
-    actual (from ``SP_PROJECTED`` / ``SP_TRADED``). All optional because
-    the stream doesn't always supply every field.
+    Carries every price the portal needs in a single object:
+
+    * ``last_price_traded`` — most recent matched price.
+    * ``best_back`` / ``best_lay`` — top of book (kept for the list view
+      that already used them; equivalent to ``back_ladder[0].price``).
+    * ``back_ladder`` / ``lay_ladder`` — top three rungs each side, in
+      Betfair's native order (best price first). The portal reverses
+      ``back_ladder`` for display so the best price sits next to BSP.
+    * ``near_price`` / ``far_price`` — projected SP from the SP_PROJECTED
+      stream channel.
+    * ``actual_sp`` — SP_TRADED value once the market has reconciled.
     """
 
     selection_id: int
@@ -564,6 +583,8 @@ class RunnerSnapshot(_Strict):
     last_price_traded: float | None = None
     best_back: float | None = None
     best_lay: float | None = None
+    back_ladder: list[PriceSize] = Field(default_factory=list)
+    lay_ladder: list[PriceSize] = Field(default_factory=list)
     near_price: float | None = None
     far_price: float | None = None
     actual_sp: float | None = None

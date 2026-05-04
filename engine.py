@@ -69,6 +69,7 @@ from models.schemas import (
     PluginConfig,
     PositionView,
     PositionsResponse,
+    PriceSize,
     ResultsResponse,
     RunnerSnapshot,
     SettledBet,
@@ -1167,14 +1168,34 @@ class LiveEngine:
 
             best_back: float | None = None
             best_lay: float | None = None
+            back_ladder: list[PriceSize] = []
+            lay_ladder: list[PriceSize] = []
             ex = getattr(runner, "ex", None)
             if ex is not None:
+                # Betfair returns the lists in best-first order — back is
+                # sorted by descending price, lay by ascending price. Keep
+                # that order; the portal reverses ``back_ladder`` at
+                # render time so the best back sits next to BSP.
                 back_list = getattr(ex, "available_to_back", None) or []
                 lay_list = getattr(ex, "available_to_lay", None) or []
-                if back_list:
-                    best_back = getattr(back_list[0], "price", None)
-                if lay_list:
-                    best_lay = getattr(lay_list[0], "price", None)
+                for ps in back_list[:3]:
+                    back_ladder.append(
+                        PriceSize(
+                            price=_safe(getattr(ps, "price", None)),
+                            size=_safe(getattr(ps, "size", None)),
+                        )
+                    )
+                for ps in lay_list[:3]:
+                    lay_ladder.append(
+                        PriceSize(
+                            price=_safe(getattr(ps, "price", None)),
+                            size=_safe(getattr(ps, "size", None)),
+                        )
+                    )
+                if back_ladder:
+                    best_back = back_ladder[0].price
+                if lay_ladder:
+                    best_lay = lay_ladder[0].price
 
             near_price: float | None = None
             far_price: float | None = None
@@ -1193,6 +1214,8 @@ class LiveEngine:
                     last_price_traded=_safe(getattr(runner, "last_price_traded", None)),
                     best_back=_safe(best_back),
                     best_lay=_safe(best_lay),
+                    back_ladder=back_ladder,
+                    lay_ladder=lay_ladder,
                     near_price=_safe(near_price),
                     far_price=_safe(far_price),
                     actual_sp=_safe(actual_sp),
