@@ -177,7 +177,14 @@ class _SettledBetRecord:
 
 @dataclass
 class _MarketCacheEntry:
-    """Cached snapshot of the latest streamed ``MarketBook`` for one market."""
+    """Cached snapshot of the latest streamed ``MarketBook`` for one market.
+
+    Runner names are sourced from the betting REST catalogue (the streaming
+    MCM feed does not include them) and cached here keyed by selection_id.
+    ``catalogue_fetched`` is set once we've made a catalogue call for the
+    market — even if it failed — to avoid retry storms on inaccessible
+    markets.
+    """
 
     market_id: str
     venue: str | None
@@ -188,6 +195,10 @@ class _MarketCacheEntry:
     runners: list[RunnerSnapshot]
     last_update: datetime
     evaluated: bool = False
+    runner_names: dict[int, str] = field(default_factory=dict)
+    market_name: str | None = None
+    event_name: str | None = None
+    catalogue_fetched: bool = False
 
 
 @dataclass
@@ -289,6 +300,10 @@ class LiveEngine:
         self._poll_orders_task: asyncio.Task[None] | None = None
         self._poll_settlement_task: asyncio.Task[None] | None = None
         self._daily_reset_task: asyncio.Task[None] | None = None
+        self._poll_catalogues_task: asyncio.Task[None] | None = None
+        # market_id -> {selection_id: runner_name}, hydrated from
+        # list_market_catalogue. Lookups are read-mostly under self._lock.
+        self._runner_names: dict[str, dict[int, str]] = {}
 
     # ------------------------------------------------------------------
     # Status accessors
@@ -843,6 +858,88 @@ class LiveEngine:
                 self._daily_reset_task = loop.create_task(
                     self._daily_reset_loop(), name="fsu100-daily-reset"
                 )
+            if (
+                self._poll_catalogues_task is None
+                or self._poll_catalogues_task.done()
+            ):
+                self._poll_catalogues_task = loop.create_task(
+                    self._poll_catalogues(), name="fsu100-poll-catalogues"
+                )
+
+    async def _poll_catalogues(self) -> None:
+        """Hydrate runner names from the betting REST catalogue.
+
+        The MCM stream only carries selection_id; runner names come from
+        ``list_market_catalogue``. The poller batches up to 100 markets
+        per call and runs every few seconds while the stream is up. Once
+        a market's names are cached they stick for the lifetime of the
+        cache entry — markets that close are evicted from
+        ``_market_cache`` and a fresh fetch happens for any that re-open.
+        """
+
+        interval = 5.0
+        batch_size = 100
+        while True:
+            await asyncio.sleep(interval)
+            with self._lock:
+                if self._stream_status is not StreamStatus.CONNECTED:
+                    return
+                missing = [
+                    mid
+                    for mid in self._market_cache.keys()
+                    if mid not in self._runner_names
+                ]
+            if not missing:
+                continue
+            for chunk_start in range(0, len(missing), batch_size):
+                chunk = missing[chunk_start : chunk_start + batch_size]
+                try:
+                    catalogue = await asyncio.to_thread(
+                        self._betfair.list_market_catalogue, chunk
+                    )
+                except BetfairServiceError:
+                    logger.exception("list_market_catalogue failed; will retry")
+                    continue
+                resolved: dict[str, dict[int, str]] = {}
+                for entry in catalogue or []:
+                    market_id = getattr(entry, "market_id", None) or (
+                        entry.get("marketId") if isinstance(entry, dict) else None
+                    )
+                    if market_id is None:
+                        continue
+                    runners = getattr(entry, "runners", None)
+                    if runners is None and isinstance(entry, dict):
+                        runners = entry.get("runners") or []
+                    names: dict[int, str] = {}
+                    for runner in runners or []:
+                        sid = getattr(runner, "selection_id", None)
+                        if sid is None and isinstance(runner, dict):
+                            sid = runner.get("selectionId")
+                        name = getattr(runner, "runner_name", None)
+                        if name is None:
+                            name = getattr(runner, "name", None)
+                        if name is None and isinstance(runner, dict):
+                            name = runner.get("runnerName") or runner.get("name")
+                        if sid is not None and name:
+                            names[int(sid)] = str(name)
+                    resolved[str(market_id)] = names
+                with self._lock:
+                    for mid, names in resolved.items():
+                        self._runner_names[mid] = names
+                        cache_entry = self._market_cache.get(mid)
+                        if cache_entry is not None:
+                            cache_entry.runner_names = names
+                            cache_entry.runners = [
+                                snapshot.model_copy(
+                                    update={
+                                        "name": names.get(
+                                            snapshot.selection_id, snapshot.name
+                                        )
+                                    }
+                                )
+                                for snapshot in cache_entry.runners
+                            ]
+                            cache_entry.catalogue_fetched = True
 
     async def _daily_reset_loop(self) -> None:
         """Auto-reset stats at midnight UTC so the daily cap resets cleanly.
@@ -1038,16 +1135,29 @@ class LiveEngine:
                 return None
             return f
 
+        market_id = getattr(market_book, "market_id", None)
         md = getattr(market_book, "market_definition", None)
         names: dict[int, str] = {}
+        # Streaming MCM only carries runner names in historic data; for live
+        # data we fall back to the catalogue cache populated by
+        # ``_poll_catalogues``.
+        with self._lock:
+            cached = self._runner_names.get(str(market_id), {}) if market_id else {}
         if md is not None:
             for definition_runner in getattr(md, "runners", []) or []:
                 sid = getattr(definition_runner, "selection_id", None)
-                if sid is not None:
-                    names[int(sid)] = (
-                        getattr(definition_runner, "name", None)
-                        or f"selection_{sid}"
-                    )
+                if sid is None:
+                    continue
+                sid_int = int(sid)
+                from_definition = getattr(definition_runner, "name", None)
+                resolved = (
+                    cached.get(sid_int)
+                    or from_definition
+                    or f"selection_{sid_int}"
+                )
+                names[sid_int] = resolved
+        for sid_int, name in cached.items():
+            names.setdefault(int(sid_int), name)
         out: list[RunnerSnapshot] = []
         for runner in getattr(market_book, "runners", []) or []:
             sid = getattr(runner, "selection_id", None)

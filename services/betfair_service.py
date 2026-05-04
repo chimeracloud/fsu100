@@ -434,6 +434,41 @@ class BetfairService:
                 f"list_market_book failed: {exc}"
             ) from exc
 
+    def list_market_catalogue(
+        self,
+        market_ids: Iterable[str],
+        max_results: int = 100,
+    ) -> Any:
+        """Return market catalogue entries (event, market name, runner names).
+
+        The streaming MCM feed does not include runner names, so we fetch
+        the catalogue once per market via the betting REST API and cache
+        the names for the lifetime of the cache entry. ``max_results`` is
+        the Betfair API per-call limit.
+        """
+
+        trading = self._require_trading()
+        ids = list(market_ids)
+        if not ids:
+            return []
+        from betfairlightweight.filters import market_filter as _mf  # noqa: PLC0415
+
+        try:
+            return trading.betting.list_market_catalogue(
+                filter=_mf(market_ids=ids),
+                market_projection=[
+                    "MARKET_DESCRIPTION",
+                    "RUNNER_DESCRIPTION",
+                    "EVENT",
+                    "EVENT_TYPE",
+                ],
+                max_results=max_results,
+            )
+        except BetfairError as exc:
+            raise BetfairServiceError(
+                f"list_market_catalogue failed: {exc}"
+            ) from exc
+
     # ------------------------------------------------------------------
     # Account
     # ------------------------------------------------------------------
