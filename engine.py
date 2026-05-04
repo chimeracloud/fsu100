@@ -777,7 +777,12 @@ class LiveEngine:
                 )
 
     def _build_runner_views(self, market_book: Any) -> list[RunnerSnapshot]:
-        """Construct :class:`RunnerSnapshot` rows for cache and GUI display."""
+        """Construct :class:`RunnerSnapshot` rows for cache and GUI display.
+
+        Extracts the full per-runner price set the portal needs — last
+        traded, best back / lay (top of book), and SP projected / actual.
+        Missing fields are left as ``None`` rather than raising.
+        """
 
         md = getattr(market_book, "market_definition", None)
         names: dict[int, str] = {}
@@ -795,12 +800,38 @@ class LiveEngine:
             if sid is None:
                 continue
             sid_int = int(sid)
+
+            best_back: float | None = None
+            best_lay: float | None = None
+            ex = getattr(runner, "ex", None)
+            if ex is not None:
+                back_list = getattr(ex, "available_to_back", None) or []
+                lay_list = getattr(ex, "available_to_lay", None) or []
+                if back_list:
+                    best_back = getattr(back_list[0], "price", None)
+                if lay_list:
+                    best_lay = getattr(lay_list[0], "price", None)
+
+            near_price: float | None = None
+            far_price: float | None = None
+            actual_sp: float | None = None
+            sp = getattr(runner, "sp", None)
+            if sp is not None:
+                near_price = getattr(sp, "near_price", None)
+                far_price = getattr(sp, "far_price", None)
+                actual_sp = getattr(sp, "actual_sp", None)
+
             out.append(
                 RunnerSnapshot(
                     selection_id=sid_int,
                     name=names.get(sid_int, f"selection_{sid_int}"),
                     status=getattr(runner, "status", None) or "ACTIVE",
                     last_price_traded=getattr(runner, "last_price_traded", None),
+                    best_back=float(best_back) if best_back is not None else None,
+                    best_lay=float(best_lay) if best_lay is not None else None,
+                    near_price=float(near_price) if near_price is not None else None,
+                    far_price=float(far_price) if far_price is not None else None,
+                    actual_sp=float(actual_sp) if actual_sp is not None else None,
                 )
             )
         return out

@@ -420,12 +420,23 @@ class CredentialStatusResponse(_Strict):
 
 
 class RunnerSnapshot(_Strict):
-    """One runner row inside :class:`MarketSnapshot` and :class:`MarketView`."""
+    """One runner row inside :class:`MarketSnapshot` and :class:`MarketView`.
+
+    Carries every price the portal needs in a single object — last traded
+    price, best back / lay (from ``EX_BEST_OFFERS``) and SP near / far /
+    actual (from ``SP_PROJECTED`` / ``SP_TRADED``). All optional because
+    the stream doesn't always supply every field.
+    """
 
     selection_id: int
     name: str
     status: str = "ACTIVE"
     last_price_traded: float | None = None
+    best_back: float | None = None
+    best_lay: float | None = None
+    near_price: float | None = None
+    far_price: float | None = None
+    actual_sp: float | None = None
 
 
 class MarketView(_Strict):

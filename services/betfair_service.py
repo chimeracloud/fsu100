@@ -183,6 +183,8 @@ class BetfairService:
                     "EX_BEST_OFFERS",
                     "EX_TRADED",
                     "EX_LTP",
+                    "SP_PROJECTED",
+                    "SP_TRADED",
                 ],
                 ladder_levels=3,
             )
