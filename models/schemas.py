@@ -263,13 +263,18 @@ class PluginConfig(_Strict):
 
 
 class EngineMode(str, Enum):
-    """Live engine operating mode.
+    """Legacy operating mode, derived from :class:`EngineFlags`.
 
-    * ``LIVE``   — stream is active and bets are placed on the exchange.
-    * ``DRY_RUN`` — stream is active, decisions are logged but no bets are
-      sent to Betfair.
-    * ``STOPPED`` — stream is closed and no bets are placed. Default on
-      startup.
+    Retained so the existing portal and any external clients can continue
+    to read a single high-level state value:
+
+    * ``LIVE``    — at least one of ``auto_betting`` / ``manual_betting``
+      is on, and ``dry_run`` is off.
+    * ``DRY_RUN`` — ``dry_run`` is on (regardless of betting toggles).
+    * ``STOPPED`` — none of the four behaviour flags is on.
+
+    The stream's connection state is reported separately via
+    :class:`StreamStatus` and is independent of mode.
     """
 
     LIVE = "LIVE"
@@ -278,7 +283,12 @@ class EngineMode(str, Enum):
 
 
 class StreamStatus(str, Enum):
-    """Reported state of the Betfair streaming socket."""
+    """Reported state of the Betfair streaming socket.
+
+    The engine maintains the stream as an always-on connection — these
+    values describe the connection's current health, not an operator
+    intent. ``ERROR`` is transient: the engine reconnects automatically.
+    """
 
     DISCONNECTED = "DISCONNECTED"
     CONNECTING = "CONNECTING"
@@ -286,8 +296,59 @@ class StreamStatus(str, Enum):
     ERROR = "ERROR"
 
 
+class FlagName(str, Enum):
+    """The four independent capability flags that drive engine behaviour.
+
+    Each flag is a binary toggle, orthogonal to the others. Stream
+    connectivity is independent of all four — the engine streams markets
+    whenever credentials and the network allow, regardless of flag state.
+    """
+
+    AUTO_BETTING = "auto_betting"
+    MANUAL_BETTING = "manual_betting"
+    DRY_RUN = "dry_run"
+    RECORDING = "recording"
+
+
+class EngineFlags(_Strict):
+    """Snapshot of the four behaviour flags.
+
+    Semantics:
+
+    * ``auto_betting`` — when on, the engine fires bets autonomously from
+      strategy decisions produced by the streamed market updates.
+    * ``manual_betting`` — when on, operators may place bets via the
+      ``POST /api/place`` endpoint. Independent of ``auto_betting``.
+    * ``dry_run`` — when on, both auto-fired and manually-placed bets are
+      simulated rather than sent to Betfair. Stats and audit log still
+      record the would-be bet so dry runs are fully observable.
+    * ``recording`` — when on, raw market change messages are persisted
+      to GCS for later replay by the backtest tool.
+    """
+
+    auto_betting: bool = False
+    manual_betting: bool = False
+    dry_run: bool = False
+    recording: bool = False
+
+
+class FlagPatch(_Strict):
+    """Body of ``PUT /admin/control/{flag}``.
+
+    A single-field body so the URL carries the flag identity and the body
+    carries the desired value.
+    """
+
+    enabled: bool
+
+
 class ControlAction(str, Enum):
-    """Recognised values for ``POST /admin/control/{action}``."""
+    """Recognised values for ``POST /admin/control/{action}``.
+
+    Retained for backwards compatibility — the new portal flips flags via
+    ``PUT /admin/control/{flag}`` instead. Each legacy action is mapped
+    onto a flag combination by :class:`LiveEngine`.
+    """
 
     START = "start"
     STOP = "stop"
@@ -297,11 +358,12 @@ class ControlAction(str, Enum):
 
 
 class ControlResponse(_Strict):
-    """Body of ``POST /admin/control/{action}``."""
+    """Body of ``POST /admin/control/{action}`` and ``PUT /admin/control/{flag}``."""
 
-    action: ControlAction
+    action: str
     accepted: bool
     mode: EngineMode
+    flags: EngineFlags
     detail: str | None = None
 
 
@@ -311,7 +373,12 @@ class ControlResponse(_Strict):
 
 
 class AdminStatus(_Strict):
-    """Body of ``GET /admin/status``."""
+    """Body of ``GET /admin/status``.
+
+    Carries the four behaviour flags and the always-on stream status.
+    ``mode`` is a derived legacy view kept for portal backwards
+    compatibility — new clients should read ``flags`` directly.
+    """
 
     service: str
     version: str
@@ -319,6 +386,7 @@ class AdminStatus(_Strict):
     uptime_seconds: float
     timestamp: datetime
     mode: EngineMode
+    flags: EngineFlags
     active_plugin: str | None
     active_plugin_version: str | None
     stream_status: StreamStatus

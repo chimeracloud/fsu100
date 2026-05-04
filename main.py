@@ -55,6 +55,9 @@ from models.schemas import (
     CancelResponse,
     ControlAction,
     ControlResponse,
+    EngineFlags,
+    FlagName,
+    FlagPatch,
     CredentialSecretStatus,
     CredentialStatusResponse,
     VariablePatchAudit,
@@ -82,11 +85,12 @@ logger = get_logger(__name__)
 
 @asynccontextmanager
 async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
-    """Build the shared singletons and wire the engine.
+    """Build the shared singletons, wire the engine, and bring the stream up.
 
-    The engine is created in :class:`EngineMode.STOPPED`. Operators must
-    explicitly start it via :func:`admin_control` after verifying the
-    deployment.
+    The Betfair stream is started immediately on container boot — markets
+    must always be visible to the portal regardless of which behaviour
+    flags are on. The four flags (auto_betting, manual_betting, dry_run,
+    recording) all default to ``False``: streaming is on, betting is off.
     """
 
     configure_logging()
@@ -123,8 +127,19 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     except Exception:  # noqa: BLE001 — startup must not fail because of overrides
         logger.exception("plugin override hydration raised; continuing with disk plugins")
 
+    # Bring the stream up so /api/markets and /api/account work from the
+    # first request. A failure here is logged but does not crash the
+    # container — the engine will reconnect on the next operator action.
+    try:
+        await engine.ensure_streaming()
+        logger.info("fsu100 stream started on boot")
+    except Exception:  # noqa: BLE001 — stream may be unhealthy but service stays up
+        logger.exception(
+            "fsu100 stream failed to start on boot; will retry on next flag change"
+        )
+
     logger.info(
-        "fsu100 service started in STOPPED mode",
+        "fsu100 service started",
         extra={
             "service": settings.service_name,
             "version": settings.version,
@@ -306,18 +321,55 @@ async def admin_activity(
     return ActivityResponse(events=events)
 
 
+@app.put(
+    "/admin/control/flags/{flag}",
+    response_model=ControlResponse,
+    tags=["admin"],
+    summary="Toggle a single behaviour flag (auto/manual betting, dry-run, recording).",
+)
+async def admin_set_flag(
+    payload: FlagPatch,
+    flag: FlagName = FastApiPath(..., description="Flag to update."),
+    engine: LiveEngine = Depends(_engine_dep),
+) -> ControlResponse:
+    """Flip one of the four engine behaviour flags.
+
+    The four flags are independent. Stream connectivity is unaffected by
+    flag changes — markets continue to populate regardless. ``dry_run``
+    is an override: while on, both auto-fired and manually-placed bets
+    are simulated rather than sent to Betfair.
+    """
+
+    try:
+        status = await engine.set_flag(flag, payload.enabled)
+    except BetfairServiceError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    return ControlResponse(
+        action=f"flag.{flag.value}",
+        accepted=True,
+        mode=status.mode,
+        flags=status.flags,
+        detail=f"{flag.value} → {payload.enabled}",
+    )
+
+
 @app.post(
     "/admin/control/{action}",
     response_model=ControlResponse,
     tags=["admin"],
-    summary="Engine controls (start, stop, dry-run, reset-stats).",
+    summary="Legacy engine controls (start, stop, dry-run, reset-stats, emergency-stop).",
 )
 async def admin_control(
     action: ControlAction = FastApiPath(..., description="Control action."),
     engine: LiveEngine = Depends(_engine_dep),
     bus: EventBus = Depends(_bus_dep),
 ) -> ControlResponse:
-    """Apply a one-shot control action and return the resulting mode."""
+    """Backwards-compatible mode controls.
+
+    Each action maps onto one or more flag flips. The new portal should
+    use ``PUT /admin/control/flags/{flag}`` directly; this endpoint is
+    retained so existing automation continues to work.
+    """
 
     try:
         if action is ControlAction.EMERGENCY_STOP:
@@ -328,10 +380,12 @@ async def admin_control(
                 detail="EMERGENCY STOP triggered by operator",
             )
             cancel_status = report.get("cancel_report", {}).get("status") or "n/a"
+            status = engine.status()
             return ControlResponse(
-                action=action,
+                action=action.value,
                 accepted=True,
-                mode=engine.status().mode,
+                mode=status.mode,
+                flags=status.flags,
                 detail=(
                     f"emergency stop completed; cancel_orders status={cancel_status}"
                 ),
@@ -339,26 +393,29 @@ async def admin_control(
         if action is ControlAction.START:
             status = await engine.start_live()
             return ControlResponse(
-                action=action,
+                action=action.value,
                 accepted=True,
                 mode=status.mode,
-                detail="engine entered LIVE mode",
+                flags=status.flags,
+                detail="auto_betting=on, dry_run=off",
             )
         if action is ControlAction.DRY_RUN:
             status = await engine.start_dry_run()
             return ControlResponse(
-                action=action,
+                action=action.value,
                 accepted=True,
                 mode=status.mode,
-                detail="engine entered DRY_RUN mode",
+                flags=status.flags,
+                detail="auto_betting=on, dry_run=on",
             )
         if action is ControlAction.STOP:
             status = await engine.stop()
             return ControlResponse(
-                action=action,
+                action=action.value,
                 accepted=True,
                 mode=status.mode,
-                detail="engine stopped",
+                flags=status.flags,
+                detail="all betting flags off; stream stays up",
             )
         if action is ControlAction.RESET_STATS:
             engine.reset_stats()
@@ -367,10 +424,12 @@ async def admin_control(
                 {},
                 detail="stats reset by operator",
             )
+            status = engine.status()
             return ControlResponse(
-                action=action,
+                action=action.value,
                 accepted=True,
-                mode=engine.status().mode,
+                mode=status.mode,
+                flags=status.flags,
                 detail="stats reset",
             )
     except BetfairServiceError as exc:

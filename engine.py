@@ -1,15 +1,33 @@
 """Live betting engine — the heart of FSU100.
 
 Manages the Betfair streaming session, applies the active strategy plugin
-to incoming market updates, and (in ``LIVE`` mode) places bets on the
-exchange. Also tracks open orders, settles cleared bets, and persists
-daily results to GCS.
+to incoming market updates, and (when the appropriate behaviour flag is
+on) places bets on the exchange. Also tracks open orders, settles cleared
+bets, and persists daily results to GCS.
 
-Operating modes
----------------
-* ``LIVE``    — stream is open, bets are placed.
-* ``DRY_RUN`` — stream is open, decisions are logged but no bets are sent.
-* ``STOPPED`` — stream is closed, no work is done. Default on startup.
+State model
+-----------
+Operator behaviour is described by four independent boolean flags:
+
+* ``auto_betting`` — engine fires bets autonomously from streamed market
+  updates.
+* ``manual_betting`` — operators may place bets via ``POST /api/place``.
+* ``dry_run`` — both auto and manual bets are simulated, never sent to
+  Betfair. Stats and audit log still record the would-be bet.
+* ``recording`` — raw market change messages are persisted to GCS for
+  later replay by the backtest tool.
+
+The Betfair stream is **always-on**: the engine logs in and connects on
+boot and reconnects automatically on failure, regardless of flag state.
+Markets always populate the cache so the portal can render them as soon
+as the page loads.
+
+The legacy :class:`EngineMode` enum is derived from the flags:
+
+* ``LIVE``    — at least one of ``auto_betting`` / ``manual_betting`` is
+  on, and ``dry_run`` is off.
+* ``DRY_RUN`` — ``dry_run`` is on (regardless of betting toggles).
+* ``STOPPED`` — none of the four flags is on.
 
 Threading model
 ---------------
@@ -42,7 +60,9 @@ from models.schemas import (
     AdminStats,
     AdminStatus,
     BetDecisionView,
+    EngineFlags,
     EngineMode,
+    FlagName,
     HistoryResponse,
     MarketsResponse,
     MarketView,
@@ -236,8 +256,12 @@ class LiveEngine:
         self._events = events
 
         self._lock = threading.RLock()
-        self._mode = EngineMode.STOPPED
+        self._auto_betting = False
+        self._manual_betting = False
+        self._dry_run = False
+        self._recording = False
         self._stream_status = StreamStatus.DISCONNECTED
+        self._streaming_requested = False
         self._started_at: datetime | None = None
 
         default_plugin = self._resolve_default_plugin()
@@ -270,6 +294,32 @@ class LiveEngine:
     # Status accessors
     # ------------------------------------------------------------------
 
+    def flags(self) -> EngineFlags:
+        """Return a snapshot of the four behaviour flags."""
+
+        with self._lock:
+            return EngineFlags(
+                auto_betting=self._auto_betting,
+                manual_betting=self._manual_betting,
+                dry_run=self._dry_run,
+                recording=self._recording,
+            )
+
+    @property
+    def _mode(self) -> EngineMode:
+        """Derive the legacy mode from the current flag combination.
+
+        Held under the engine lock at every read site. Pure function of
+        the four bools, kept as a property so the rest of the engine can
+        continue to read ``self._mode`` without churn.
+        """
+
+        if self._dry_run:
+            return EngineMode.DRY_RUN
+        if self._auto_betting or self._manual_betting:
+            return EngineMode.LIVE
+        return EngineMode.STOPPED
+
     def status(self) -> AdminStatus:
         """Return the snapshot served by ``GET /admin/status``."""
 
@@ -293,6 +343,12 @@ class LiveEngine:
                 uptime_seconds=uptime,
                 timestamp=datetime.now(timezone.utc),
                 mode=self._mode,
+                flags=EngineFlags(
+                    auto_betting=self._auto_betting,
+                    manual_betting=self._manual_betting,
+                    dry_run=self._dry_run,
+                    recording=self._recording,
+                ),
                 active_plugin=plugin_name,
                 active_plugin_version=plugin_version,
                 stream_status=self._stream_status,
@@ -511,27 +567,134 @@ class LiveEngine:
     # Mode transitions
     # ------------------------------------------------------------------
 
-    async def start_live(self) -> AdminStatus:
-        return await self._transition_to(EngineMode.LIVE)
+    async def ensure_streaming(self) -> AdminStatus:
+        """Bring the Betfair stream up if it isn't already.
 
-    async def start_dry_run(self) -> AdminStatus:
-        return await self._transition_to(EngineMode.DRY_RUN)
-
-    async def stop(self) -> AdminStatus:
-        return await self._transition_to(EngineMode.STOPPED)
-
-    async def emergency_stop(self) -> dict[str, Any]:
-        """Kill switch — cancel every open order, then stop the stream.
-
-        Distinct from :meth:`stop` (orderly): this issues a platform-wide
-        cancel on Betfair *before* tearing the session down so unmatched
-        orders can't lapse to fill while we're shutting down. Safe to
-        call from any mode. Returns a small report so the caller can
-        surface what was actioned.
+        Called from the FastAPI lifespan on container startup so the
+        engine is authenticated and streaming markets the moment the
+        service is ready, without waiting for an operator action. The
+        method is idempotent — if the stream is already connected it
+        is a no-op.
         """
 
         with self._lock:
-            previous_mode = self._mode
+            already_up = self._stream_status is StreamStatus.CONNECTED
+            self._streaming_requested = True
+        if already_up:
+            return self.status()
+
+        try:
+            await asyncio.to_thread(self._spin_up_session)
+        except Exception as exc:
+            with self._lock:
+                self._stream_status = StreamStatus.ERROR
+            await self._events.publish(
+                "error",
+                {"message": str(exc)},
+                detail=f"stream failed to come up: {exc}",
+            )
+            raise
+
+        with self._lock:
+            if self._started_at is None:
+                self._started_at = datetime.now(timezone.utc)
+            self._start_async_pollers()
+
+        await self._events.publish(
+            "stream_ready",
+            {},
+            detail="engine is streaming markets and ready for flag changes",
+        )
+        return self.status()
+
+    async def set_flag(
+        self,
+        flag: FlagName,
+        enabled: bool,
+    ) -> AdminStatus:
+        """Set a single behaviour flag and emit a ``flag_changed`` event.
+
+        The stream is not touched — toggling betting / dry-run / recording
+        does not connect or disconnect the Betfair session. ``manual_betting``
+        and ``auto_betting`` may be on simultaneously; ``dry_run`` is an
+        override that simulates rather than transmits any bet that would
+        otherwise be placed.
+        """
+
+        with self._lock:
+            attr = f"_{flag.value}"
+            previous = getattr(self, attr)
+            if previous == enabled:
+                return self.status()
+            setattr(self, attr, enabled)
+            new_flags = EngineFlags(
+                auto_betting=self._auto_betting,
+                manual_betting=self._manual_betting,
+                dry_run=self._dry_run,
+                recording=self._recording,
+            )
+            new_mode = self._mode
+
+        await self._events.publish(
+            "flag_changed",
+            {
+                "flag": flag.value,
+                "previous": previous,
+                "current": enabled,
+                "flags": new_flags.model_dump(),
+                "mode": new_mode.value,
+            },
+            detail=f"{flag.value} → {enabled}",
+        )
+
+        if self._streaming_requested:
+            try:
+                await self.ensure_streaming()
+            except Exception:
+                logger.warning("ensure_streaming after flag change failed")
+
+        return self.status()
+
+    async def start_live(self) -> AdminStatus:
+        """Legacy compat: turn ``auto_betting`` on, ``dry_run`` off."""
+
+        await self.set_flag(FlagName.DRY_RUN, False)
+        return await self.set_flag(FlagName.AUTO_BETTING, True)
+
+    async def start_dry_run(self) -> AdminStatus:
+        """Legacy compat: turn ``auto_betting`` and ``dry_run`` on."""
+
+        await self.set_flag(FlagName.AUTO_BETTING, True)
+        return await self.set_flag(FlagName.DRY_RUN, True)
+
+    async def stop(self) -> AdminStatus:
+        """Legacy compat: turn the betting flags off, leave the stream up."""
+
+        await self.set_flag(FlagName.AUTO_BETTING, False)
+        await self.set_flag(FlagName.MANUAL_BETTING, False)
+        return await self.set_flag(FlagName.DRY_RUN, False)
+
+    async def emergency_stop(self) -> dict[str, Any]:
+        """Kill switch — cancel every open order and force all flags off.
+
+        The Betfair stream is **not** torn down: keeping it up ensures
+        the portal continues to render market data and the operator can
+        immediately resume from a clean state. Distinct from :meth:`stop`,
+        this issues a platform-wide cancel on Betfair so unmatched orders
+        can't lapse to fill during the freeze.
+        """
+
+        with self._lock:
+            previous_flags = EngineFlags(
+                auto_betting=self._auto_betting,
+                manual_betting=self._manual_betting,
+                dry_run=self._dry_run,
+                recording=self._recording,
+            )
+            self._auto_betting = False
+            self._manual_betting = False
+            self._dry_run = False
+            self._recording = False
 
         cancel_report: dict[str, Any] = {"attempted": False}
         if self._betfair.is_authenticated:
@@ -556,60 +719,23 @@ class LiveEngine:
                     "error_code": str(exc),
                 }
 
-        await self._teardown_session(reason="emergency stop")
-
-        with self._lock:
-            self._mode = EngineMode.STOPPED
-
         await self._events.publish(
             "emergency_stop",
-            {"previous_mode": previous_mode.value, "cancel_report": cancel_report},
+            {
+                "previous_flags": previous_flags.model_dump(),
+                "cancel_report": cancel_report,
+            },
             detail=(
-                f"EMERGENCY STOP from {previous_mode.value}: "
+                f"EMERGENCY STOP: all flags off; "
                 f"cancel status={cancel_report.get('status', 'n/a')}"
             ),
         )
 
         return {
-            "previous_mode": previous_mode.value,
+            "previous_flags": previous_flags.model_dump(),
             "cancel_report": cancel_report,
             "status": self.status().model_dump(mode="json"),
         }
-
-    async def _transition_to(self, target: EngineMode) -> AdminStatus:
-        with self._lock:
-            current = self._mode
-            if current is target:
-                return self.status()
-
-        if target is EngineMode.STOPPED:
-            await self._teardown_session(reason="operator stopped engine")
-        else:
-            try:
-                self._spin_up_session()
-            except Exception as exc:
-                with self._lock:
-                    self._mode = EngineMode.STOPPED
-                    self._stream_status = StreamStatus.ERROR
-                await self._events.publish(
-                    "error",
-                    {"message": str(exc)},
-                    detail=f"failed to enter {target.value}: {exc}",
-                )
-                raise
-
-        with self._lock:
-            self._mode = target
-            if target is not EngineMode.STOPPED:
-                self._started_at = datetime.now(timezone.utc)
-            self._start_async_pollers()
-
-        await self._events.publish(
-            "mode_changed",
-            {"old_mode": current.value, "new_mode": target.value},
-            detail=f"mode changed from {current.value} to {target.value}",
-        )
-        return self.status()
 
     def _spin_up_session(self) -> None:
         """Login, start the stream, and launch the processing thread."""
@@ -682,11 +808,16 @@ class LiveEngine:
         )
 
     def _start_async_pollers(self) -> None:
-        """Schedule the order and settlement polling tasks if not already running."""
+        """Schedule the order and settlement polling tasks if not already running.
+
+        Pollers run as long as the stream is up, regardless of which
+        behaviour flags are on — outstanding orders and settlements are
+        worth tracking even when the engine isn't placing new bets.
+        """
 
         loop = asyncio.get_running_loop()
         with self._lock:
-            if self._mode is EngineMode.STOPPED:
+            if self._stream_status is not StreamStatus.CONNECTED:
                 return
             if self._poll_orders_task is None or self._poll_orders_task.done():
                 self._poll_orders_task = loop.create_task(
@@ -720,7 +851,7 @@ class LiveEngine:
             )
             await asyncio.sleep((tomorrow - now).total_seconds())
             with self._lock:
-                if self._mode is EngineMode.STOPPED:
+                if self._stream_status is not StreamStatus.CONNECTED:
                     return
                 self._stats.reset()
                 self._recent_settled.clear()
@@ -810,6 +941,8 @@ class LiveEngine:
             market_types = tuple(self._runtime_config.market_types)
             point_value = self._runtime_config.point_value
             mode = self._mode
+            auto_betting = self._auto_betting
+            dry_run = self._dry_run
             customer_strategy_ref = self._runtime_config.customer_strategy_ref
 
         results = evaluate(
@@ -866,7 +999,7 @@ class LiveEngine:
                     f"@ {bet.price} for {bet.stake}"
                 ),
             )
-            if mode is EngineMode.LIVE:
+            if auto_betting and not dry_run:
                 self._place_bet_sync(
                     market_id=market_id,
                     bet=bet,
@@ -1107,18 +1240,41 @@ class LiveEngine:
 
         if not self._betfair.is_authenticated:
             raise BetfairServiceError(
-                "engine is not authenticated; start LIVE or DRY_RUN mode first"
+                "engine is not authenticated; the always-on stream has not "
+                "yet logged in"
             )
         with self._lock:
-            mode = self._mode
+            manual_betting = self._manual_betting
+            dry_run = self._dry_run
             customer_strategy_ref = self._runtime_config.customer_strategy_ref
-        if mode is not EngineMode.LIVE:
+        if not manual_betting:
             raise BetfairServiceError(
-                f"refusing to place bet in mode {mode.value}; switch to LIVE first"
+                "refusing to place bet: manual_betting flag is off"
             )
         cap_block = self._check_daily_cap(decision.stake)
         if cap_block is not None:
             raise BetfairServiceError(cap_block)
+        if dry_run:
+            return {
+                "status": "SUCCESS",
+                "instruction_reports": [
+                    {
+                        "status": "SUCCESS",
+                        "bet_id": None,
+                        "instruction": {
+                            "selection_id": decision.selection_id,
+                            "limit_order": {
+                                "size": decision.stake,
+                                "price": decision.price,
+                                "persistence_type": persistence_type,
+                            },
+                        },
+                        "size_matched": 0.0,
+                        "average_price_matched": 0.0,
+                        "dry_run": True,
+                    }
+                ],
+            }
         response = self._betfair.place_lay_order(
             market_id=market_id,
             selection_id=decision.selection_id,
@@ -1562,10 +1718,12 @@ class LiveEngine:
     ) -> dict[str, Any]:
         """Apply a flat map of dotted-path → value patches to a plugin.
 
-        Mode-locked: engine must be ``STOPPED``. Patches are validated
-        against ``_meta`` bounds (when declared) before being applied. The
-        plugin object held in :class:`PluginStore` is mutated in place,
-        the full updated plugin is mirrored to GCS at
+        Locked while either betting flag is on: changing strategy values
+        underneath an engine that is actively placing bets is unsafe.
+        ``dry_run`` and ``recording`` do not block patches. Patches are
+        validated against ``_meta`` bounds (when declared) before being
+        applied. The plugin object held in :class:`PluginStore` is mutated
+        in place, the full updated plugin is mirrored to GCS at
         ``overrides/<plugin>.json``, and one audit row per applied change
         is appended to ``audit/<YYYY-MM-DD>.jsonl``. An SSE
         ``plugin_variables_applied`` event fires on success.
@@ -1577,10 +1735,11 @@ class LiveEngine:
         """
 
         with self._lock:
-            mode = self._mode
-        if mode is not EngineMode.STOPPED:
+            betting_active = self._auto_betting or self._manual_betting
+        if betting_active:
             raise PermissionError(
-                f"engine must be STOPPED to apply variable patches; current mode={mode.value}"
+                "refusing to apply variable patches while a betting flag is on; "
+                "turn off auto_betting and manual_betting first"
             )
 
         try:
