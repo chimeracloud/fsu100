@@ -231,8 +231,20 @@ class StrategyConfig(_Strict):
     controls: StrategyControls = Field(default_factory=StrategyControls)
 
 
-class StakingConfig(_Strict):
-    """How stake numbers in rules translate to currency."""
+class StakingConfig(BaseModel):
+    """How stake numbers in rules translate to currency.
+
+    ``extra="allow"`` so plugins can carry the per-variable ``_meta``
+    block (min/max/step/default) the Configurator uses to render bounded
+    inputs. The evaluator only reads ``point_value``; other fields are
+    pass-through metadata.
+    """
+
+    model_config = ConfigDict(
+        extra="allow",
+        str_strip_whitespace=True,
+        populate_by_name=True,
+    )
 
     point_value: float = Field(
         default=1.0,
@@ -241,12 +253,21 @@ class StakingConfig(_Strict):
     )
 
 
-class PluginConfig(_Strict):
+class PluginConfig(BaseModel):
     """Full plugin payload.
 
     Identical to the Backtest Tool's plugin schema so a JSON file authored
-    for one tool runs in the other without changes.
+    for one tool runs in the other without changes. ``extra="allow"`` so
+    operator-authored plugins can carry top-level metadata fields
+    (``author``, ``sport``, ``compatible_tools``, …) without code churn —
+    they're surfaced by the schema endpoint but the engine ignores them.
     """
+
+    model_config = ConfigDict(
+        extra="allow",
+        str_strip_whitespace=True,
+        populate_by_name=True,
+    )
 
     name: str
     version: str
