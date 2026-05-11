@@ -91,6 +91,25 @@ class GcsService:
                 f"service account cannot read gs://{bucket}/{blob_name}"
             ) from exc
 
+    def delete_blob(self, bucket: str, blob_name: str) -> bool:
+        """Delete a blob. Returns True if removed, False if it didn't exist.
+
+        Used by the Strategy page DELETE action so an operator can remove
+        a saved plugin from the store. A missing blob is not an error —
+        the desired state (no GCS copy) is already true.
+        """
+
+        try:
+            blob = self._client.bucket(bucket).blob(blob_name)
+            blob.delete()
+            return True
+        except NotFound:
+            return False
+        except PermissionDenied as exc:
+            raise RuntimeError(
+                f"service account cannot delete gs://{bucket}/{blob_name}"
+            ) from exc
+
     def list_blob_names(self, bucket: str, prefix: str) -> list[str]:
         """List blob names within a bucket under ``prefix``."""
 

@@ -99,6 +99,28 @@ class PluginStore:
             raise PluginNotFoundError(name)
         return plugin
 
+    def upsert(self, plugin: PluginConfig) -> None:
+        """Insert or replace a plugin in the in-memory registry.
+
+        Used by the Strategy-page SAVE flow: the API layer validates the
+        payload, calls ``upsert`` to make the plugin immediately
+        visible to GET endpoints, then mirrors it to GCS for durability.
+        Re-running :meth:`refresh` afterwards would wipe this entry
+        unless the GCS hydration step re-adds it — see engine startup.
+        """
+
+        self._plugins[plugin.name] = plugin
+
+    def remove(self, name: str) -> bool:
+        """Remove a plugin from the in-memory registry.
+
+        Returns True if the plugin was present, False if no plugin by
+        that name was registered (idempotent). The caller is responsible
+        for deleting the GCS copy too.
+        """
+
+        return self._plugins.pop(name, None) is not None
+
     def schema_for(self, name: str) -> StrategySchema:
         """Return the editor schema served by GET /api/strategies/{name}/schema."""
 

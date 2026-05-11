@@ -71,6 +71,7 @@ from models.schemas import (
     PlaceRequest,
     PlaceReport,
     PlaceResponse,
+    PluginConfig,
     PositionsResponse,
     ResultsResponse,
     SettledResponse,
@@ -126,6 +127,19 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
             )
     except Exception:  # noqa: BLE001 — startup must not fail because of overrides
         logger.exception("plugin override hydration raised; continuing with disk plugins")
+
+    # Hydrate operator-authored full plugins from the Strategy page so
+    # newly-saved plugins are immediately visible to the listing endpoint
+    # and to the evaluator (GCS wins over disk on name collision).
+    try:
+        strategies = await engine.hydrate_strategies_from_gcs()
+        if strategies:
+            logger.info(
+                "rehydrated authored strategies from GCS",
+                extra={"plugins": list(strategies.keys())},
+            )
+    except Exception:  # noqa: BLE001 — startup must not fail because of authored plugins
+        logger.exception("strategy hydration raised; continuing with disk plugins")
 
     # Bring the stream up so /api/markets and /api/account work from the
     # first request. A failure here is logged but does not crash the
@@ -569,6 +583,69 @@ async def get_strategy_schema(
             status_code=404,
             detail=f"plugin '{name}' not installed",
         ) from exc
+
+
+@app.put(
+    "/api/strategies/{name}",
+    response_model=StrategyInfo,
+    tags=["gui"],
+    summary="Create or replace a plugin (writes JSON to GCS).",
+)
+async def put_strategy(
+    name: str,
+    plugin: PluginConfig,
+    engine: LiveEngine = Depends(_engine_dep),
+) -> StrategyInfo:
+    """Save the plugin JSON to GCS at ``strategies/<name>.json``.
+
+    The in-memory plugin store is updated immediately so subsequent
+    GETs see the new shape. Mode-locked: returns 409 while either
+    betting flag is on (engine.save_strategy raises PermissionError).
+    Returns a :class:`StrategyInfo` summary identical to what
+    ``/api/strategies`` would list.
+    """
+
+    if plugin.name != name:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"name in URL ({name!r}) does not match plugin.name "
+                f"({plugin.name!r})"
+            ),
+        )
+    try:
+        saved = await engine.save_strategy(name, plugin)
+    except PermissionError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return StrategyInfo(
+        name=saved.name,
+        version=saved.version,
+        description=saved.description,
+        rule_count=len(saved.strategy.rules),
+    )
+
+
+@app.delete(
+    "/api/strategies/{name}",
+    tags=["gui"],
+    summary="Delete a saved plugin from GCS.",
+)
+async def delete_strategy(
+    name: str,
+    engine: LiveEngine = Depends(_engine_dep),
+) -> dict[str, Any]:
+    """Remove the plugin's GCS copy.
+
+    If a disk-baked plugin with the same name exists, the in-memory
+    store falls back to it; otherwise the plugin disappears from
+    listings. Mode-locked: returns 409 while either betting flag is on.
+    """
+
+    try:
+        removed = await engine.delete_strategy(name)
+    except PermissionError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return {"name": name, "removed": removed}
 
 
 @app.post(

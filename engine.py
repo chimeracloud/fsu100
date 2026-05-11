@@ -48,6 +48,8 @@ from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
 from typing import Any, Iterable
 
+from pydantic import ValidationError
+
 from core.config import AppSettings, get_settings
 from core.events import EventBus
 from core.logging import get_logger
@@ -2106,6 +2108,159 @@ class LiveEngine:
                 "failed to persist plugin overrides",
                 extra={"bucket": bucket, "blob_name": blob_name},
             )
+
+    # ------------------------------------------------------------------
+    # Strategy page — full plugin SAVE / DELETE / hydrate
+    # ------------------------------------------------------------------
+    #
+    # Strategy authoring writes whole plugin JSON files to GCS under
+    # ``strategies/<name>.json``. These complement (and where named the
+    # same as) plugins shipped on the container's disk: GCS plugins
+    # always win on name collision. ``hydrate_strategies_from_gcs`` is
+    # called from the FastAPI lifespan after the PluginStore loads from
+    # disk so authored plugins survive container restarts and show up
+    # for both the live engine and the backtest service.
+
+    async def save_strategy(
+        self, name: str, plugin: PluginConfig
+    ) -> PluginConfig:
+        """Persist a full plugin JSON to GCS and the in-memory store.
+
+        Mode-locked: refuses to save while either betting flag is on so
+        an in-flight bet sequence doesn't see its strategy change mid-run.
+        ``name`` (the URL param) must match ``plugin.name``; the caller
+        is responsible for the validation but we double-check here.
+        """
+
+        if name != plugin.name:
+            raise ValueError(
+                f"name in URL ({name!r}) does not match plugin.name "
+                f"({plugin.name!r})"
+            )
+        with self._lock:
+            betting_active = self._auto_betting or self._manual_betting
+        if betting_active:
+            raise PermissionError(
+                "refusing to save strategy while a betting flag is on; "
+                "turn off auto_betting and manual_betting first"
+            )
+
+        bucket = self._runtime_config.results_bucket
+        blob_name = f"strategies/{plugin.name}.json"
+        payload = json.dumps(plugin.model_dump(mode="json"), indent=2)
+        await asyncio.to_thread(
+            self._gcs.upload_text, bucket, blob_name, payload
+        )
+        self._plugins.upsert(plugin)
+        await self._events.publish(
+            "strategy_saved",
+            {"name": plugin.name, "version": plugin.version},
+            detail=f"strategy '{plugin.name}' saved to GCS",
+        )
+        return plugin
+
+    async def delete_strategy(self, name: str) -> bool:
+        """Delete a strategy from GCS and the in-memory store.
+
+        Falls back to the disk copy when one exists: after removing the
+        GCS blob we re-scan the plugin store from disk and re-hydrate
+        from GCS so any other authored plugins remain visible.
+
+        Returns True when the in-memory plugin was actually removed,
+        False if it was already gone.
+        """
+
+        with self._lock:
+            betting_active = self._auto_betting or self._manual_betting
+        if betting_active:
+            raise PermissionError(
+                "refusing to delete strategy while a betting flag is on; "
+                "turn off auto_betting and manual_betting first"
+            )
+
+        bucket = self._runtime_config.results_bucket
+        blob_name = f"strategies/{name}.json"
+        try:
+            await asyncio.to_thread(
+                self._gcs.delete_blob, bucket, blob_name
+            )
+        except RuntimeError:
+            logger.exception(
+                "failed to delete plugin GCS blob",
+                extra={"bucket": bucket, "blob_name": blob_name},
+            )
+            raise
+
+        removed_in_memory = self._plugins.remove(name)
+
+        # Reload disk + GCS so any disk-baked plugin with the same name
+        # is restored and any other authored plugins stay visible.
+        self._plugins.refresh()
+        await self.hydrate_strategies_from_gcs()
+
+        await self._events.publish(
+            "strategy_deleted",
+            {"name": name},
+            detail=f"strategy '{name}' deleted",
+        )
+        return removed_in_memory
+
+    async def hydrate_strategies_from_gcs(self) -> dict[str, int]:
+        """Load all plugins persisted via the Strategy page into the store.
+
+        Called from the FastAPI lifespan after the on-disk plugins load.
+        Each ``strategies/*.json`` blob is parsed as a :class:`PluginConfig`
+        and upserted into the store — GCS wins on name collisions with
+        disk-baked plugins so operator edits take precedence.
+
+        Returns a small report mapping plugin name → 1 (loaded) so the
+        caller can log how many strategies were hydrated.
+        """
+
+        bucket = self._runtime_config.results_bucket
+        try:
+            blob_names = await asyncio.to_thread(
+                self._gcs.list_blob_names, bucket, "strategies/"
+            )
+        except RuntimeError:
+            logger.exception(
+                "failed to list strategies prefix",
+                extra={"bucket": bucket, "prefix": "strategies/"},
+            )
+            return {}
+
+        report: dict[str, int] = {}
+        for blob_name in blob_names:
+            if not blob_name.endswith(".json"):
+                continue
+            try:
+                text = await asyncio.to_thread(
+                    self._gcs.download_text, bucket, blob_name
+                )
+            except RuntimeError:
+                logger.warning(
+                    "could not read strategy blob",
+                    extra={"bucket": bucket, "blob_name": blob_name},
+                )
+                continue
+            if not text:
+                continue
+            try:
+                payload = json.loads(text)
+                plugin = PluginConfig.model_validate(payload)
+            except (ValueError, ValidationError) as exc:
+                logger.warning(
+                    "strategy blob failed validation",
+                    extra={
+                        "bucket": bucket,
+                        "blob_name": blob_name,
+                        "error": str(exc),
+                    },
+                )
+                continue
+            self._plugins.upsert(plugin)
+            report[plugin.name] = 1
+        return report
 
     async def _persist_audit_rows(
         self, rows: list[dict[str, Any]]
