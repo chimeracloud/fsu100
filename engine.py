@@ -2205,6 +2205,81 @@ class LiveEngine:
         )
         return removed_in_memory
 
+    async def hydrate_recent_settled_from_gcs(self) -> int:
+        """Repopulate ``_recent_settled`` from today's persisted JSONL.
+
+        Every bet that settles is appended to ``settled/<date>.jsonl`` in
+        the results bucket. On container restart the in-memory list is
+        empty until the next live bet settles, so ``/api/results``
+        returns nothing for races that already concluded — and the
+        portal's market rows lose their LAID/WON/LOST info on refresh.
+
+        This pass reads today's file (and yesterday's, in case the
+        container restarted just after midnight UTC) and rebuilds
+        ``_recent_settled`` newest-first. ``_known_settled_bet_ids`` is
+        seeded too so the live ``poll_orders`` loop doesn't reprocess
+        bets it's already recorded.
+
+        Returns the number of records loaded.
+        """
+
+        bucket = self._runtime_config.results_bucket
+        today = datetime.now(timezone.utc).date()
+        yesterday = today.fromordinal(today.toordinal() - 1)
+
+        loaded: list[_SettledBetRecord] = []
+        for day in (today, yesterday):
+            blob_name = self._gcs.settled_blob_name(day)
+            try:
+                text = await asyncio.to_thread(
+                    self._gcs.download_text, bucket, blob_name
+                )
+            except RuntimeError:
+                logger.warning(
+                    "could not read settled jsonl",
+                    extra={"bucket": bucket, "blob_name": blob_name},
+                )
+                continue
+            if not text:
+                continue
+            for line in text.splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    payload = json.loads(line)
+                    view = SettledBet.model_validate(payload)
+                except (ValueError, ValidationError):
+                    logger.warning(
+                        "skipping malformed settled bet line",
+                        extra={"blob_name": blob_name},
+                    )
+                    continue
+                loaded.append(
+                    _SettledBetRecord(
+                        bet_id=view.bet_id,
+                        market_id=view.market_id,
+                        selection_id=view.selection_id,
+                        runner_name=view.runner_name,
+                        side=view.side,
+                        price=view.price,
+                        stake=view.stake,
+                        liability=view.liability,
+                        rule_applied=view.rule_applied,
+                        outcome=view.outcome,
+                        pnl=view.pnl,
+                        settled_at=view.settled_at,
+                    )
+                )
+
+        # Newest first matches the live insertion order; cap at the
+        # standard recency window so we don't blow the response size.
+        loaded.sort(key=lambda r: r.settled_at, reverse=True)
+        with self._lock:
+            self._recent_settled = loaded[: self._MAX_RECENT_SETTLED]
+            self._known_settled_bet_ids = {r.bet_id for r in self._recent_settled}
+        return len(self._recent_settled)
+
     async def hydrate_strategies_from_gcs(self) -> dict[str, int]:
         """Load all plugins persisted via the Strategy page into the store.
 

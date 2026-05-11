@@ -141,6 +141,21 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     except Exception:  # noqa: BLE001 — startup must not fail because of authored plugins
         logger.exception("strategy hydration raised; continuing with disk plugins")
 
+    # Rebuild today's settled-bet list from the persisted JSONL so
+    # /api/results returns the right rows after a container restart.
+    # Without this, the Lay Engine markets table loses LAID/WON/LOST
+    # info on page refresh whenever the engine was restarted between
+    # bet settlement and the operator's reload.
+    try:
+        settled_count = await engine.hydrate_recent_settled_from_gcs()
+        if settled_count:
+            logger.info(
+                "rehydrated recent settled bets from GCS",
+                extra={"count": settled_count},
+            )
+    except Exception:  # noqa: BLE001 — startup must not fail because of settled hydration
+        logger.exception("settled-bet hydration raised; /api/results may be empty until next settlement")
+
     # Bring the stream up so /api/markets and /api/account work from the
     # first request. A failure here is logged but does not crash the
     # container — the engine will reconnect on the next operator action.
