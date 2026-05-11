@@ -272,7 +272,13 @@ class PluginConfig(BaseModel):
     name: str
     version: str
     description: str | None = None
-    source: SourceConfig
+    # Source is optional — FSU100 never reads from historic GCS files (it
+    # streams live from Betfair) and the country/market_type filters that
+    # used to live under source.filters are now sourced from AdminConfig
+    # (countries / market_types fields) which already act as the live
+    # streaming filter. Older plugin JSONs that still embed a source block
+    # continue to validate; the engine just doesn't consult it.
+    source: SourceConfig | None = None
     parser: ParserConfig = Field(default_factory=ParserConfig)
     strategy: StrategyConfig
     staking: StakingConfig = Field(default_factory=StakingConfig)

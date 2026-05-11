@@ -277,13 +277,21 @@ class LiveEngine:
         self._started_at: datetime | None = None
 
         default_plugin = self._resolve_default_plugin()
+        # The live streaming filter (countries + market_types) is owned by
+        # AdminConfig — plugins no longer pin a source. Seed from legacy
+        # plugin.source.filters when present (older plugin JSONs), otherwise
+        # start with broad GB/IE WIN defaults which the operator can refine
+        # via PUT /admin/config.
+        legacy_filters = default_plugin.source.filters if default_plugin.source else None
+        seed_countries = list(legacy_filters.countries) if legacy_filters else ["GB", "IE"]
+        seed_market_types = list(legacy_filters.market_types) if legacy_filters else ["WIN"]
         self._runtime_config = EngineRuntimeConfig(
             log_level=settings.log_level,
             activity_log_size=settings.activity_log_size,
             results_bucket=settings.results_bucket,
             active_plugin=default_plugin.name,
-            countries=list(default_plugin.source.filters.countries),
-            market_types=list(default_plugin.source.filters.market_types),
+            countries=seed_countries,
+            market_types=seed_market_types,
             point_value=default_plugin.staking.point_value,
             customer_strategy_ref=settings.customer_strategy_ref,
             daily_max_stake_enabled=False,
@@ -2093,12 +2101,23 @@ class LiveEngine:
             if point_value_override is not None
             else plugin.staking.point_value
         )
+        # Live streaming filters live on the admin runtime config, not on
+        # the plugin. Fall back to plugin.source.filters only when an older
+        # plugin payload still embeds them (otherwise empty = no extra
+        # parse-time filtering on top of the streaming filter).
+        legacy_filters = plugin.source.filters if plugin.source else None
         results = evaluate(
             snapshot,
             plugin.strategy,
             point_value=point_value,
-            filters_country=plugin.source.filters.countries,
-            filters_market_type=plugin.source.filters.market_types,
+            filters_country=(
+                legacy_filters.countries if legacy_filters
+                else self._runtime_config.countries
+            ),
+            filters_market_type=(
+                legacy_filters.market_types if legacy_filters
+                else self._runtime_config.market_types
+            ),
         )
         bets = [r for r in results if isinstance(r, BetDecision)]
         skipped = [r for r in results if isinstance(r, NoBet)]
