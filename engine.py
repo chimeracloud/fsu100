@@ -196,6 +196,12 @@ class _MarketCacheEntry:
     runners: list[RunnerSnapshot]
     last_update: datetime
     evaluated: bool = False
+    # Betfair market_definition.status (OPEN/SUSPENDED/CLOSED/INACTIVE).
+    # Populated from each book update so the portal can show CLOSED
+    # once a race finishes.
+    status: str | None = None
+    # Set when the market closes and Betfair flags a winning runner.
+    winner_selection_id: int | None = None
     runner_names: dict[int, str] = field(default_factory=dict)
     market_name: str | None = None
     event_name: str | None = None
@@ -466,6 +472,8 @@ class LiveEngine:
                         seconds_to_off=seconds_to_off,
                         in_play=entry.in_play,
                         evaluated=entry.evaluated,
+                        status=entry.status,
+                        winner_selection_id=entry.winner_selection_id,
                         runners=list(entry.runners),
                     )
                 )
@@ -1013,6 +1021,21 @@ class LiveEngine:
         venue = getattr(md, "venue", None) if md is not None else None
         country = getattr(md, "country_code", None) if md is not None else None
         market_type = getattr(md, "market_type", None) if md is not None else None
+        # market_definition.status is one of OPEN / SUSPENDED / CLOSED /
+        # INACTIVE — feed it through to MarketView so the portal can
+        # distinguish "race finished" (CLOSED) from "race running"
+        # (in_play=True, status=OPEN).
+        status = getattr(md, "status", None) if md is not None else None
+        # If the market has closed, look for the winning runner so the
+        # operator can see who won at a glance. Runner status comes from
+        # market_definition.runners[*].status — "WINNER" / "LOSER" /
+        # "REMOVED" / "ACTIVE".
+        winner_selection_id: int | None = None
+        if status == "CLOSED" and md is not None:
+            for rd in getattr(md, "runners", None) or []:
+                if getattr(rd, "status", None) == "WINNER":
+                    winner_selection_id = getattr(rd, "selection_id", None)
+                    break
 
         with self._lock:
             cache_entry = self._market_cache.get(market_id)
@@ -1024,6 +1047,8 @@ class LiveEngine:
                 market_type=market_type,
                 market_time=market_time,
                 in_play=in_play,
+                status=status,
+                winner_selection_id=winner_selection_id,
                 runners=runner_views,
                 last_update=datetime.now(timezone.utc),
                 evaluated=already_evaluated,
@@ -1114,12 +1139,40 @@ class LiveEngine:
                     f"@ {bet.price} for {bet.stake}"
                 ),
             )
-            if auto_betting and not dry_run:
-                self._place_bet_sync(
-                    market_id=market_id,
-                    bet=bet,
-                    customer_strategy_ref=customer_strategy_ref,
-                )
+            if auto_betting:
+                if dry_run:
+                    # Simulate the bet — no Betfair call, no _OpenOrder
+                    # entry (we don't want to skew real exposure stats).
+                    # Emit the bet_placed event with dry_run=true so the
+                    # portal can surface the dry-run bet on the markets
+                    # table just like a real one.
+                    self._events.publish_threadsafe(
+                        "bet_placed",
+                        {
+                            "market_id": market_id,
+                            "bet_id": None,
+                            "rule": bet.rule_applied,
+                            "selection_id": bet.selection_id,
+                            "runner_name": bet.runner_name,
+                            "side": bet.side.value,
+                            "price": bet.price,
+                            "stake": bet.stake,
+                            "liability": bet.liability,
+                            "dry_run": True,
+                        },
+                        market_id=market_id,
+                        detail=(
+                            f"DRY: {bet.rule_applied} "
+                            f"{bet.side.value} {bet.runner_name} "
+                            f"@ {bet.price} for {bet.stake}"
+                        ),
+                    )
+                else:
+                    self._place_bet_sync(
+                        market_id=market_id,
+                        bet=bet,
+                        customer_strategy_ref=customer_strategy_ref,
+                    )
 
     def _build_runner_views(self, market_book: Any) -> list[RunnerSnapshot]:
         """Construct :class:`RunnerSnapshot` rows for cache and GUI display.

@@ -628,6 +628,14 @@ class MarketView(_Strict):
     seconds_to_off: float | None
     in_play: bool
     evaluated: bool
+    # Betfair market_definition.status — typically one of
+    # "INACTIVE", "OPEN", "SUSPENDED", "CLOSED". CLOSED means the race
+    # has finished and the winner is determined. Distinct from in_play
+    # which is true only while the race is actively running.
+    status: str | None = None
+    # selection_id of the winning runner, populated once a market closes
+    # and Betfair flags one runner as WINNER. None until then.
+    winner_selection_id: int | None = None
     runners: list[RunnerSnapshot]
 
 
