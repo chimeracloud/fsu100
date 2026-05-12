@@ -431,6 +431,10 @@ class AdminStatus(_Strict):
     flags: EngineFlags
     active_plugin: str | None
     active_plugin_version: str | None
+    # Full set of plugins live auto-betting is currently evaluating.
+    # Defaults to ``[active_plugin]`` when multi-plugin support hasn't
+    # been opted into; head of the list is always the primary.
+    active_plugins: list[str] = Field(default_factory=list)
     stream_status: StreamStatus
     markets_in_cache: int
 
@@ -445,7 +449,17 @@ class AdminConfig(_Strict):
     log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR"]
     activity_log_size: int = Field(ge=10, le=1000)
     results_bucket: str
+    # Primary plugin name. Kept as a single string for backward
+    # compatibility with portal clients that read one active plugin.
+    # When ``active_plugins`` is supplied the primary is the first
+    # entry of that list; this field is the head-of-list view.
     active_plugin: str
+    # Full set of plugins the live engine should evaluate every
+    # market against. Optional — defaults to ``[active_plugin]`` so
+    # legacy single-plugin clients keep working. Each plugin's bets
+    # fire independently; per-bet events carry ``plugin_name`` so the
+    # portal can attribute decisions back to their source.
+    active_plugins: list[str] = Field(default_factory=list)
     countries: list[str] = Field(
         description=(
             "ISO country codes used as the streaming filter. "

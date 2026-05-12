@@ -102,21 +102,29 @@ class EngineRuntimeConfig:
     activity_log_size: int
     results_bucket: str
     active_plugin: str
-    countries: list[str]
-    market_types: list[str]
-    point_value: float
-    customer_strategy_ref: str
+    # Full list of plugins live auto-betting should evaluate. When
+    # empty, the engine falls back to ``[active_plugin]`` so legacy
+    # callers see no change.
+    active_plugins: list[str] = field(default_factory=list)
+    countries: list[str] = field(default_factory=list)
+    market_types: list[str] = field(default_factory=list)
+    point_value: float = 1.0
+    customer_strategy_ref: str = ""
     daily_max_stake_enabled: bool = False
     daily_max_stake: float = 0.0
 
     def to_admin_config(self) -> AdminConfig:
         """Produce the :class:`AdminConfig` view served by the admin API."""
 
+        # Always surface a non-empty active_plugins list; clients can
+        # ignore it and just read active_plugin if they only support one.
+        active_list = list(self.active_plugins) if self.active_plugins else [self.active_plugin]
         return AdminConfig(
             log_level=self.log_level,  # type: ignore[arg-type]
             activity_log_size=self.activity_log_size,
             results_bucket=self.results_bucket,
             active_plugin=self.active_plugin,
+            active_plugins=active_list,
             countries=list(self.countries),
             market_types=list(self.market_types),
             point_value=self.point_value,
@@ -298,6 +306,9 @@ class LiveEngine:
             activity_log_size=settings.activity_log_size,
             results_bucket=settings.results_bucket,
             active_plugin=default_plugin.name,
+            # Initial multi-plugin list seeds to just the default plugin.
+            # The operator can add more via PUT /admin/config.
+            active_plugins=[default_plugin.name],
             countries=seed_countries,
             market_types=seed_market_types,
             point_value=default_plugin.staking.point_value,
@@ -383,6 +394,11 @@ class LiveEngine:
                 ),
                 active_plugin=plugin_name,
                 active_plugin_version=plugin_version,
+                active_plugins=(
+                    list(self._runtime_config.active_plugins)
+                    if self._runtime_config.active_plugins
+                    else ([plugin_name] if plugin_name else [])
+                ),
                 stream_status=self._stream_status,
                 markets_in_cache=len(self._market_cache),
             )
@@ -394,13 +410,35 @@ class LiveEngine:
     def update_runtime_config(self, payload: AdminConfig) -> AdminConfig:
         """Apply ``PUT /admin/config`` and return the resulting config."""
 
+        # Resolve the multi-plugin list: when the payload provides
+        # ``active_plugins`` it wins, with the primary ``active_plugin``
+        # forced to its first entry. When the payload omits the list,
+        # the primary becomes the sole entry. Every name in the list
+        # must exist in the plugin store or the whole update fails.
+        primary = payload.active_plugin
+        if payload.active_plugins:
+            # Dedupe but preserve order so the operator's selection
+            # ordering is meaningful (primary at top).
+            seen: set[str] = set()
+            full_list: list[str] = []
+            for name in payload.active_plugins:
+                if name and name not in seen:
+                    seen.add(name)
+                    full_list.append(name)
+            if full_list:
+                primary = full_list[0]
+        else:
+            full_list = [primary]
+
         with self._lock:
-            self._plugins.get(payload.active_plugin)
+            for name in full_list:
+                self._plugins.get(name)  # raises PluginNotFoundError if missing
             self._runtime_config = EngineRuntimeConfig(
                 log_level=payload.log_level,
                 activity_log_size=payload.activity_log_size,
                 results_bucket=payload.results_bucket,
-                active_plugin=payload.active_plugin,
+                active_plugin=primary,
+                active_plugins=full_list,
                 countries=list(payload.countries),
                 market_types=list(payload.market_types),
                 point_value=payload.point_value,
@@ -1063,13 +1101,17 @@ class LiveEngine:
         if in_play:
             return
 
-        try:
-            plugin = self._active_plugin()
-        except PluginNotFoundError:
+        active_plugins = self._active_plugins()
+        if not active_plugins:
             return
-        threshold = plugin.parser.time_before_off_seconds
+        # The pre-off window is set per-plugin; use the widest window so
+        # every plugin gets a chance to evaluate the same market. (If
+        # one plugin specifies 10 min and another 5, both fire at 5
+        # min and the 10-min plugin also fires earlier — its first call
+        # already gates on its own threshold below.)
+        widest_threshold = max(p.parser.time_before_off_seconds for p in active_plugins)
         seconds_to_off = (market_time - publish_time).total_seconds()
-        if seconds_to_off > threshold:
+        if seconds_to_off > widest_threshold:
             return
         if seconds_to_off <= 0:
             with self._lock:
@@ -1087,94 +1129,109 @@ class LiveEngine:
             dry_run = self._dry_run
             customer_strategy_ref = self._runtime_config.customer_strategy_ref
 
-        results = evaluate(
-            market_book,
-            plugin.strategy,
-            point_value=point_value,
-            filters_country=countries,
-            filters_market_type=market_types,
-        )
-        bets: list[BetDecision] = [r for r in results if isinstance(r, BetDecision)]
-        skipped: list[NoBet] = [r for r in results if isinstance(r, NoBet)]
-
+        # Mark the market evaluated once across the loop so we don't
+        # double-count it in markets_processed when more than one
+        # plugin contributes a decision.
         with self._lock:
             entry = self._market_cache.get(market_id)
             if entry is not None:
                 entry.evaluated = True
             self._stats.markets_processed += 1
 
-        if not bets:
-            reason = skipped[0].reason if skipped else "no_decision"
-            detail = skipped[0].detail if skipped else "evaluator returned no decisions"
-            self._events.publish_threadsafe(
-                "evaluation",
-                {
-                    "market_id": market_id,
-                    "decision": "NO_BET",
-                    "reason": reason,
-                    "detail": detail,
-                },
-                market_id=market_id,
-                detail=f"NO_BET: {reason}",
+        # Each active plugin gets an independent evaluation pass. Bets
+        # fire per-plugin and the SSE payload carries ``plugin_name`` so
+        # the portal can attribute every decision back to its source.
+        for plugin in active_plugins:
+            if seconds_to_off > plugin.parser.time_before_off_seconds:
+                # This plugin's window is tighter than the widest one;
+                # skip it on this book and pick it up on a later one.
+                continue
+            results = evaluate(
+                market_book,
+                plugin.strategy,
+                point_value=point_value,
+                filters_country=countries,
+                filters_market_type=market_types,
             )
-            return
+            bets: list[BetDecision] = [r for r in results if isinstance(r, BetDecision)]
+            skipped: list[NoBet] = [r for r in results if isinstance(r, NoBet)]
 
-        for bet in bets:
-            self._events.publish_threadsafe(
-                "evaluation",
-                {
-                    "market_id": market_id,
-                    "decision": "BET",
-                    "rule": bet.rule_applied,
-                    "selection_id": bet.selection_id,
-                    "runner_name": bet.runner_name,
-                    "side": bet.side.value,
-                    "price": bet.price,
-                    "stake": bet.stake,
-                    "liability": bet.liability,
-                    "mode": mode.value,
-                },
-                market_id=market_id,
-                detail=(
-                    f"{mode.value}: {bet.rule_applied} "
-                    f"{bet.side.value} {bet.runner_name} "
-                    f"@ {bet.price} for {bet.stake}"
-                ),
-            )
-            if auto_betting:
-                if dry_run:
-                    # Simulate the bet — no Betfair call, no _OpenOrder
-                    # entry (we don't want to skew real exposure stats).
-                    # Emit the bet_placed event with dry_run=true so the
-                    # portal can surface the dry-run bet on the markets
-                    # table just like a real one.
-                    self._events.publish_threadsafe(
-                        "bet_placed",
-                        {
-                            "market_id": market_id,
-                            "bet_id": None,
-                            "rule": bet.rule_applied,
-                            "selection_id": bet.selection_id,
-                            "runner_name": bet.runner_name,
-                            "side": bet.side.value,
-                            "price": bet.price,
-                            "stake": bet.stake,
-                            "liability": bet.liability,
-                            "dry_run": True,
-                        },
-                        market_id=market_id,
-                        detail=(
-                            f"DRY: {bet.rule_applied} "
-                            f"{bet.side.value} {bet.runner_name} "
-                            f"@ {bet.price} for {bet.stake}"
-                        ),
-                    )
-                else:
-                    self._place_bet_sync(
-                        market_id=market_id,
-                        bet=bet,
-                        customer_strategy_ref=customer_strategy_ref,
-                    )
+            if not bets:
+                reason = skipped[0].reason if skipped else "no_decision"
+                detail = skipped[0].detail if skipped else "evaluator returned no decisions"
+                self._events.publish_threadsafe(
+                    "evaluation",
+                    {
+                        "market_id": market_id,
+                        "plugin_name": plugin.name,
+                        "decision": "NO_BET",
+                        "reason": reason,
+                        "detail": detail,
+                    },
+                    market_id=market_id,
+                    detail=f"{plugin.name} NO_BET: {reason}",
+                )
+                continue
+
+            for bet in bets:
+                self._events.publish_threadsafe(
+                    "evaluation",
+                    {
+                        "market_id": market_id,
+                        "plugin_name": plugin.name,
+                        "decision": "BET",
+                        "rule": bet.rule_applied,
+                        "selection_id": bet.selection_id,
+                        "runner_name": bet.runner_name,
+                        "side": bet.side.value,
+                        "price": bet.price,
+                        "stake": bet.stake,
+                        "liability": bet.liability,
+                        "mode": mode.value,
+                    },
+                    market_id=market_id,
+                    detail=(
+                        f"{plugin.name} {mode.value}: {bet.rule_applied} "
+                        f"{bet.side.value} {bet.runner_name} "
+                        f"@ {bet.price} for {bet.stake}"
+                    ),
+                )
+                if auto_betting:
+                    if dry_run:
+                        # Simulate the bet — no Betfair call, no
+                        # _OpenOrder entry (we don't want to skew real
+                        # exposure stats). Emit bet_placed with
+                        # dry_run=True so the portal can surface the
+                        # dry-run bet on the markets table.
+                        self._events.publish_threadsafe(
+                            "bet_placed",
+                            {
+                                "market_id": market_id,
+                                "plugin_name": plugin.name,
+                                "bet_id": None,
+                                "rule": bet.rule_applied,
+                                "selection_id": bet.selection_id,
+                                "runner_name": bet.runner_name,
+                                "side": bet.side.value,
+                                "price": bet.price,
+                                "stake": bet.stake,
+                                "liability": bet.liability,
+                                "dry_run": True,
+                            },
+                            market_id=market_id,
+                            detail=(
+                                f"{plugin.name} DRY: {bet.rule_applied} "
+                                f"{bet.side.value} {bet.runner_name} "
+                                f"@ {bet.price} for {bet.stake}"
+                            ),
+                        )
+                    else:
+                        self._place_bet_sync(
+                            market_id=market_id,
+                            bet=bet,
+                            customer_strategy_ref=customer_strategy_ref,
+                            plugin_name=plugin.name,
+                        )
 
     def _build_runner_views(self, market_book: Any) -> list[RunnerSnapshot]:
         """Construct :class:`RunnerSnapshot` rows for cache and GUI display.
@@ -1287,11 +1344,46 @@ class LiveEngine:
         return out
 
     def _active_plugin(self) -> PluginConfig:
-        """Return the plugin matching the current ``runtime_config.active_plugin``."""
+        """Return the plugin matching the current ``runtime_config.active_plugin``.
+
+        Single-plugin accessor kept for the parts of the codebase that
+        still resolve one primary plugin (status reporting, schema
+        endpoints, etc.). The market-evaluation loop uses
+        :meth:`_active_plugins` instead so multi-plugin auto-betting
+        fires bets from every selected strategy.
+        """
 
         with self._lock:
             name = self._runtime_config.active_plugin
         return self._plugins.get(name)
+
+    def _active_plugins(self) -> list[PluginConfig]:
+        """Return every plugin live auto-betting should evaluate.
+
+        Uses ``runtime_config.active_plugins`` when non-empty,
+        falling back to the single primary plugin. Plugins that
+        no longer exist in the store (e.g. deleted between PUT
+        /admin/config and the next market book) are silently
+        dropped — the system survives a missing plugin rather than
+        stopping evaluation across the others.
+        """
+
+        with self._lock:
+            names = list(self._runtime_config.active_plugins) or [self._runtime_config.active_plugin]
+        out: list[PluginConfig] = []
+        seen: set[str] = set()
+        for name in names:
+            if not name or name in seen:
+                continue
+            seen.add(name)
+            try:
+                out.append(self._plugins.get(name))
+            except PluginNotFoundError:
+                logger.warning(
+                    "active plugin not installed; skipping for this evaluation pass",
+                    extra={"plugin": name},
+                )
+        return out
 
     def _resolve_default_plugin(self) -> PluginConfig:
         """Return the default plugin configured in :class:`AppSettings`."""
@@ -1345,8 +1437,14 @@ class LiveEngine:
         market_id: str,
         bet: BetDecision,
         customer_strategy_ref: str,
+        plugin_name: str | None = None,
     ) -> None:
-        """Place a bet on Betfair from the streaming thread."""
+        """Place a bet on Betfair from the streaming thread.
+
+        ``plugin_name`` is included on the ``bet_placed`` SSE payload
+        when multi-plugin auto-betting fires the decision so the
+        portal can attribute each row back to its source plugin.
+        """
 
         cap_block = self._check_daily_cap(bet.stake)
         if cap_block is not None:
@@ -1428,6 +1526,7 @@ class LiveEngine:
             "bet_placed",
             {
                 "market_id": market_id,
+                "plugin_name": plugin_name,
                 "bet_id": order.bet_id,
                 "rule": bet.rule_applied,
                 "selection_id": bet.selection_id,
@@ -1441,6 +1540,7 @@ class LiveEngine:
             detail=(
                 f"placed {bet.side.value} {bet.runner_name} @ {bet.price} "
                 f"for {bet.stake}, bet_id={order.bet_id}"
+                + (f" [{plugin_name}]" if plugin_name else "")
             ),
         )
 
