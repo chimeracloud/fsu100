@@ -39,7 +39,7 @@ class AppSettings(BaseSettings):
         description="Logical name of the service, used for logs and traces.",
     )
     version: str = Field(
-        default="1.0.0",
+        default="1.2.0",
         description="Semantic version of the deployed service.",
     )
     environment: Literal["development", "staging", "production"] = Field(

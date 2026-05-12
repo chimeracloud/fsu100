@@ -11,29 +11,31 @@ The engine reports its running version on `GET /admin/status`.
 
 ## [Unreleased]
 
-### Added
-
-- `chimera_may2026_v1` plugin now loads cleanly after the schema
-  loosening in `1.1.1`. The portal Configurator and the Lay Engine
-  PluginCard render its full ruleset (Rule 1, 2a–c, 3A, 3B) and every
-  control toggle.
-
 ### Pending wire-up
 
-The `chimera_may2026_v1` plugin declares several controls the evaluator
-does not yet read. They round-trip through the schema and persist on
-the plugin (audit-safe) but have no effect on placement until each is
-wired into `evaluator.py`:
-
-- `mark_ceiling_enabled` / `mark_floor_enabled` / `mark_uplift_enabled`
-  — currently enforced unconditionally via the existing `hard_ceiling`,
-  `hard_floor`, and `mark_uplift` controls. The new `*_enabled` toggles
-  are observed but not consulted.
-- `signal_overround` / `signal_field_size` / `signal_steam_gate` /
-  `signal_band_perf` / `market_overlay_modifier` — flagged on the
-  configurator but not connected to any pre-bet gate yet.
-- `top2_concentration_enabled` and the `top2_06_*` / `top2_07_*` /
-  `top2_08_*` blocks — not yet integrated with the rule selector.
+- **Layered plugin pipeline.** Plugin roles (`rule` / `control` /
+  `modifier`) are first-class on the schema and recognised by the
+  Acceptor as of `1.2.0`, but the engine still pipelines every active
+  plugin as a rule plugin in parallel. Controls (`cluster_concentration_v1`,
+  `three_horse_cluster_guardrail`) need to run *before* rules to gate
+  their bets; modifiers (`meeting_streak_dampener_v1`) need to run
+  *after* rules to scale stake. Until this lands, mixing roles in
+  `AdminConfig.active_plugins` produces duplicate bets — use the
+  control plugin *instead of* the rule plugin as a workaround.
+- **AI-on-API plugin generator.** Operator-facing endpoint that takes a
+  natural-language brief plus `plugin_role` hint, calls a model, and
+  returns Acceptor-validated JSON ready to save. Spec is being written
+  by Claude Strategy.
+- `chimera_may2026_v1` outstanding wire-ups (carried forward from
+  `1.1.1`):
+  - `mark_ceiling_enabled` / `mark_floor_enabled` / `mark_uplift_enabled`
+    — currently enforced unconditionally via the existing controls; the
+    new `*_enabled` toggles are observed but not consulted.
+  - `signal_overround` / `signal_field_size` / `signal_steam_gate` /
+    `signal_band_perf` / `market_overlay_modifier` — flagged on the
+    configurator but not connected to any pre-bet gate yet.
+  - `top2_concentration_enabled` and the `top2_06_*` / `top2_07_*` /
+    `top2_08_*` blocks — not yet integrated with the rule selector.
 
 ### Known follow-ups
 
@@ -43,10 +45,123 @@ wired into `evaluator.py`:
 - `/api/account` and `/api/results/summary` should return a structured
   `STOPPED` payload (200) rather than a 5xx when the engine has
   not yet finished its first authentication on a cold start.
+- Backtest worker durability — move from in-process to Cloud Tasks /
+  Cloud Run Jobs so an in-flight backtest survives a deploy.
+
+---
+
+## [1.2.0] — 2026-05-12
+
+### Added
+
+- **Plugin Acceptor — `core/plugin_normaliser.py`.** Every plugin JSON
+  arriving via `PUT /api/strategies/{name}` is now normalised before
+  Pydantic validation. The Acceptor applies a fixed set of repair rules
+  documented in `Chimera_Plugin_Template.json` v2.0 and returns the
+  repair log in the response so the portal can surface what was
+  auto-fixed:
+  - Rewrites known wrong key names: `plugin_name` → `name`,
+    `plugin_version` → `version`, `plugin_type` → `plugin_role`,
+    `purpose` → `description`.
+  - Hoists a top-level `rules` array under `strategy.rules`
+    automatically (or under `strategy.guardrail_rules` when the plugin
+    is a control / modifier and the rules lack `odds_band`).
+  - Injects a `noop_passthrough` rule on `plugin_role: "control"` /
+    `"modifier"` plugins missing rules — satisfies the schema's
+    `min_length=1` without inventing a real bet.
+  - Coerces malformed `odds_band` shapes — `{min, max}` objects,
+    string-encoded numbers, inverted tuples, sub-1.01 lower bounds.
+  - Parks rules with no `base_stake` or `stake`
+    (`base_stake: 0, enabled: false`) rather than 422'ing.
+  - Fills documented defaults for every optional field (`parser`,
+    `staking.point_value`, `compatible_tools`, `author`, `sport`,
+    `plugin_role`). Missing `name` is synthesised from author +
+    description + epoch minutes or taken from the URL hint.
+  - 28-test suite (`tests/test_plugin_normaliser.py`) covers every
+    repair rule and includes an end-to-end test that Mark's
+    ChatGPT-authored `three_horse_cluster` plugin (3 schema errors
+    under the previous strict body) now loads cleanly with 5 repairs
+    logged. ([`5c475f3`](https://github.com/chimeracloud/fsu100/commit/5c475f3))
+- **Multi-plugin auto-betting.** `AdminConfig.active_plugins: list[str]`
+  lets the operator run multiple plugins simultaneously. Legacy
+  `active_plugin` (single string) is preserved as the head-of-list view
+  for portal backwards compatibility. Each fired bet carries
+  `plugin_name` so the portal can attribute decisions back to their
+  source. ([`fcbb2d8`](https://github.com/chimeracloud/fsu100/commit/fcbb2d8))
+- **`PUT` and `DELETE /api/strategies/{name}`.** Full plugin CRUD.
+  PUT writes the validated JSON to GCS at
+  `gs://chiops-fsu100-results/strategies/<name>.json` and updates the
+  in-memory plugin store; DELETE removes both. Both are mode-locked —
+  409 while either betting flag is on. The Strategy page in the portal
+  was rewritten on top of these endpoints (rename from "Configurator",
+  inline name / version / description editors, plugin list panel with
+  edit / download / delete per row, LOAD PLUGIN file picker for
+  external JSON). ([`bd392cd`](https://github.com/chimeracloud/fsu100/commit/bd392cd))
+- **Settled-bets hydration on startup.** Engine reads the daily settled
+  JSONL from GCS at boot and repopulates the in-memory `_recent_settled`
+  ring buffer. Fixes settled bets disappearing from the portal after a
+  Cloud Run cold start. ([`f13cd0d`](https://github.com/chimeracloud/fsu100/commit/f13cd0d))
+- **Market status + winner on `MarketView`.** `status` (Betfair
+  `market_definition.status` — `OPEN` / `SUSPENDED` / `CLOSED`) and
+  `winner_selection_id` (populated when the market closes with a
+  `WINNER` flag) are exposed on `/api/markets`. The portal uses these
+  to render CLOSED banners and infer WON / LOST outcomes inline per
+  row. `bet_placed` SSE events now also fire in `dry_run` mode
+  (previously suppressed). ([`7638655`](https://github.com/chimeracloud/fsu100/commit/7638655))
+- **Bundled plugin — `cluster_concentration_v1`.** Mark's 4-runner
+  cluster suppression. Detects markets where 3–5 runners are tightly
+  grouped at the top of the field and shifts the engine into
+  cluster-mode behaviour. Authored as `plugin_role: "control"`.
+  ([`5f74d54`](https://github.com/chimeracloud/fsu100/commit/5f74d54))
+- **Bundled plugin — `meeting_streak_dampener_v1`.** Mark's stake
+  modifier. When the first two consecutive races at a meeting are both
+  won by the pre-off favourite, stake on every remaining race at that
+  meeting is multiplied by 0.75× (acceptable range `[0.70, 0.75]`
+  preserved for calibration sweeps). `plugin_role: "modifier"`.
+  Loads and validates today; actual stake-dampening activates once the
+  layered pipeline lands. ([`6b985c5`](https://github.com/chimeracloud/fsu100/commit/6b985c5))
+
+### Changed
+
+- **`PluginConfig.source` is now optional.** FSU100 never consults the
+  historic `source` block (it always streams live from Betfair), and
+  the country / market-type filters that used to live under
+  `source.filters` are driven by `AdminConfig.countries` /
+  `AdminConfig.market_types`. Plugins authored with no `source` block
+  now load. ([`cb83e1b`](https://github.com/chimeracloud/fsu100/commit/cb83e1b))
+- **`PluginConfig` and `StrategyConfig` allow extras.** Same
+  `extra="allow"` relaxation already applied to `StrategyControls`,
+  `StrategyRule`, and `StakingConfig` in `1.1.1` now extends to the
+  top-level plugin shape and the strategy block. Plugins can carry
+  sport-specific or experimental blocks (`cluster_detection`,
+  `cluster_rules`, `modifier_logic`, `control_logic`, `_meta` bounds)
+  alongside the canonical `rules` / `controls` pair without code churn.
+  ([`5f74d54`](https://github.com/chimeracloud/fsu100/commit/5f74d54))
+- **`PUT /api/strategies/{name}` response shape.** The endpoint now
+  returns the `StrategyInfo` fields *plus* an `acceptor_repairs: list[str]`
+  describing every auto-fix the normaliser applied. Clients reading
+  only the legacy `StrategyInfo` fields are unaffected. ([`5c475f3`](https://github.com/chimeracloud/fsu100/commit/5c475f3))
+
+### Schema additions (operator-visible, non-breaking)
+
+- `AdminConfig.active_plugins: list[str]`
+- `AdminStatus.active_plugins: list[str]`
+- `MarketView.status: str | None`
+- `MarketView.winner_selection_id: int | None`
+- `plugin_role: "rule" | "control" | "modifier"` is recognised as a
+  top-level plugin field via the schema's `extra="allow"`. Default
+  filled by the Acceptor when absent is `"rule"`.
 
 ---
 
 ## [1.1.1] — 2026-05-08
+
+### Added
+
+- `chimera_may2026_v1` plugin now loads cleanly after the schema
+  loosening below. The portal Configurator and the Lay Engine
+  PluginCard render its full ruleset (Rule 1, 2a–c, 3A, 3B) and every
+  control toggle.
 
 ### Fixed
 
