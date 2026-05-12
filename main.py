@@ -28,7 +28,7 @@ from contextlib import asynccontextmanager
 from datetime import date, datetime, timezone
 from typing import Any, AsyncIterator
 
-from fastapi import Depends, FastAPI, HTTPException, Path as FastApiPath, Query
+from fastapi import Body, Depends, FastAPI, HTTPException, Path as FastApiPath, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import ValidationError
@@ -37,6 +37,7 @@ from sse_starlette.sse import EventSourceResponse
 from core.config import AppSettings, get_settings
 from core.events import EventBus, get_event_bus
 from core.logging import configure_logging, get_logger
+from core.plugin_normaliser import normalise_plugin_payload
 from core.plugin_store import (
     PluginNotFoundError,
     PluginStore,
@@ -602,42 +603,72 @@ async def get_strategy_schema(
 
 @app.put(
     "/api/strategies/{name}",
-    response_model=StrategyInfo,
     tags=["gui"],
     summary="Create or replace a plugin (writes JSON to GCS).",
 )
 async def put_strategy(
     name: str,
-    plugin: PluginConfig,
+    payload: dict[str, Any] = Body(...),
     engine: LiveEngine = Depends(_engine_dep),
-) -> StrategyInfo:
+) -> dict[str, Any]:
     """Save the plugin JSON to GCS at ``strategies/<name>.json``.
+
+    The body is treated as a raw plugin JSON dict and run through the
+    Acceptor (``core.plugin_normaliser``) before Pydantic validation.
+    The Acceptor applies the buffer rules documented in
+    ``Chimera_Plugin_Template.json`` v2.0 — auto-filling missing
+    optional fields, rewriting known wrong key names (``plugin_name``
+    → ``name``, top-level ``rules`` → ``strategy.rules``), coercing
+    structurally salvageable malformations. The list of repairs is
+    returned alongside the saved :class:`StrategyInfo` so the portal
+    can surface them as warnings.
 
     The in-memory plugin store is updated immediately so subsequent
     GETs see the new shape. Mode-locked: returns 409 while either
-    betting flag is on (engine.save_strategy raises PermissionError).
-    Returns a :class:`StrategyInfo` summary identical to what
-    ``/api/strategies`` would list.
+    betting flag is on (``engine.save_strategy`` raises
+    ``PermissionError``).
     """
+
+    try:
+        normalised, repairs = normalise_plugin_payload(dict(payload), name_hint=name)
+    except TypeError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    try:
+        plugin = PluginConfig.model_validate(normalised)
+    except ValidationError as exc:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "message": "plugin failed schema validation after acceptor repairs",
+                "errors": exc.errors(),
+                "acceptor_repairs": repairs,
+            },
+        ) from exc
 
     if plugin.name != name:
         raise HTTPException(
             status_code=400,
             detail=(
                 f"name in URL ({name!r}) does not match plugin.name "
-                f"({plugin.name!r})"
+                f"({plugin.name!r}) after acceptor repairs"
             ),
         )
     try:
         saved = await engine.save_strategy(name, plugin)
     except PermissionError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
-    return StrategyInfo(
+
+    info = StrategyInfo(
         name=saved.name,
         version=saved.version,
         description=saved.description,
         rule_count=len(saved.strategy.rules),
     )
+    return {
+        **info.model_dump(),
+        "acceptor_repairs": repairs,
+    }
 
 
 @app.delete(
