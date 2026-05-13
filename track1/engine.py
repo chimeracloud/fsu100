@@ -538,48 +538,88 @@ class Engine:
 
     def _place_real(self, result: EvaluationResult) -> None:
         for instr in result.instructions:
+            # The Betfair HTTP call happens BEFORE we try to parse the
+            # response. Split the two so a parsing error doesn't leave
+            # a placed-but-untracked bet sitting on Betfair.
+            report = None
             try:
                 report = self._trading.betting.place_orders(
                     market_id=result.market_id,
                     instructions=[instr.to_betfair_instruction()],
                     customer_strategy_ref="fsu100-track1",
                 )
-                bet_id = None
-                if report.instruction_reports:
-                    bet_id = report.instruction_reports[0].bet_id
-                placed = PlacedBet(
-                    market_id=result.market_id,
-                    selection_id=instr.selection_id,
-                    runner_name=instr.runner_name,
-                    side="LAY",
-                    price=instr.price,
-                    stake=instr.size,
-                    liability=instr.liability,
-                    rule_applied=instr.rule_applied,
-                    bet_id=bet_id,
-                    simulated=False,
-                )
-                self._placed.append(placed)
-                self._results.append_placement(placed.to_dict())
-                self._push_event("placement", placed.to_dict())
-                # Cache the rich context so _poll_settlement can hydrate
-                # the SettledBet — Betfair's list_cleared_orders doesn't
-                # carry market_name / venue / race_time / rule_applied.
-                if bet_id:
-                    self._placement_context[bet_id] = {
-                        "market_id": result.market_id,
-                        "market_name": result.market_name,
-                        "venue": result.venue,
-                        "race_time": result.race_time,
-                        "runner_name": instr.runner_name,
-                        "rule_applied": instr.rule_applied,
-                    }
             except Exception as exc:
-                logger.exception("place_orders failed: %s", exc)
+                logger.exception("place_orders HTTP failed: %s", exc)
                 self._push_event(
                     "error",
-                    {"market_id": result.market_id, "detail": str(exc)},
+                    {"market_id": result.market_id, "detail": f"place_orders HTTP failed: {exc}"},
                 )
+                continue
+
+            # betfairlightweight's PlaceOrders resource exposes
+            # ``place_instruction_reports`` (NOT ``instruction_reports``).
+            # We accept both names defensively in case the lib changes.
+            reports = (
+                getattr(report, "place_instruction_reports", None)
+                or getattr(report, "instruction_reports", None)
+                or []
+            )
+            overall_status = getattr(report, "status", None)
+            bet_id: Optional[str] = None
+            instruction_status: Optional[str] = None
+            error_code = getattr(report, "error_code", None)
+
+            if reports:
+                first = reports[0]
+                bet_id = getattr(first, "bet_id", None)
+                instruction_status = getattr(first, "status", None)
+                if not error_code:
+                    error_code = getattr(first, "error_code", None)
+
+            # Status: SUCCESS means matched/queued on Betfair. FAILURE means
+            # it didn't take. We record both — operator needs to see failures
+            # so they don't think the bet is live when it isn't.
+            placed = PlacedBet(
+                market_id=result.market_id,
+                selection_id=instr.selection_id,
+                runner_name=instr.runner_name,
+                side="LAY",
+                price=instr.price,
+                stake=instr.size,
+                liability=instr.liability,
+                rule_applied=instr.rule_applied,
+                bet_id=bet_id,
+                simulated=False,
+            )
+            self._placed.append(placed)
+            self._results.append_placement(placed.to_dict())
+            self._push_event("placement", placed.to_dict())
+
+            if instruction_status == "FAILURE" or overall_status == "FAILURE":
+                logger.warning(
+                    "place_orders FAILURE: market=%s code=%s",
+                    result.market_id, error_code,
+                )
+                self._push_event(
+                    "error",
+                    {
+                        "market_id": result.market_id,
+                        "detail": f"Betfair rejected placement: {error_code or 'unknown'}",
+                    },
+                )
+
+            # Cache the rich context so _poll_settlement can hydrate
+            # the SettledBet — Betfair's list_cleared_orders doesn't
+            # carry market_name / venue / race_time / rule_applied.
+            if bet_id:
+                self._placement_context[bet_id] = {
+                    "market_id": result.market_id,
+                    "market_name": result.market_name,
+                    "venue": result.venue,
+                    "race_time": result.race_time,
+                    "runner_name": instr.runner_name,
+                    "rule_applied": instr.rule_applied,
+                }
 
     def _place_simulated(self, result: EvaluationResult) -> None:
         for instr in result.instructions:
