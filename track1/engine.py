@@ -364,13 +364,24 @@ class Engine:
         if market_def.in_play or market_def.status != "OPEN":
             return
 
-        # Inside the configured process window?
+        # Window check. In LIVE the engine waits until the configured
+        # process window (default 5 min before off) to take the snapshot
+        # the strategy was designed around. In DRY_RUN we lift the upper
+        # bound so the operator can validate the pipeline immediately
+        # instead of waiting hours for races to enter the window — at
+        # the cost that the prices the evaluator sees are whatever the
+        # market shows on first sight, not the T-5min snapshot. Use this
+        # for plumbing validation, not strategy-timing validation.
+        # Lower bound (closed markets) is enforced in both modes.
         seconds_to_off = (
             market_time - datetime.now(tz=timezone.utc)
         ).total_seconds()
-        window = self._settings.general.process_window_mins * 60
-        if seconds_to_off < 0 or seconds_to_off > window:
+        if seconds_to_off < 0:
             return
+        if self._settings.general.mode == Mode.LIVE:
+            window = self._settings.general.process_window_mins * 60
+            if seconds_to_off > window:
+                return
 
         snapshot = _snapshot_from_book(book)
         result = evaluate(snapshot, self._settings)
