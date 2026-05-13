@@ -220,17 +220,31 @@ class Engine:
         """Flip mode and (re)start/stop the stream.
 
         ``action`` is one of ``start`` (DRY_RUN), ``live``, ``stop``.
+
+        Clears the in-memory dedup set on every action so a mode change
+        re-evaluates every market still in the stream cache. Without
+        this, DRY_RUN's window bypass evaluates markets 1-2h before
+        off; switching to LIVE leaves those market_ids in the dedup
+        set, so when they finally enter the T-5min LIVE window the
+        engine skips them and no bets fire. Clearing the set is the
+        operator's "fresh session from here" signal.
         """
 
         action = (action or "").lower()
         if action == "start":
             self._settings.general.mode = Mode.DRY_RUN
+            self._evaluated_markets.clear()
+            logger.info("control:start — cleared evaluated_markets, entering DRY_RUN")
             self._ensure_stream_running()
         elif action == "live":
             self._settings.general.mode = Mode.LIVE
+            self._evaluated_markets.clear()
+            logger.info("control:live — cleared evaluated_markets, entering LIVE")
             self._ensure_stream_running()
         elif action == "stop":
             self._settings.general.mode = Mode.STOPPED
+            self._evaluated_markets.clear()
+            logger.info("control:stop — cleared evaluated_markets, mode STOPPED")
             self._stop_stream()
         else:
             raise ValueError(f"unknown action: {action!r}")
