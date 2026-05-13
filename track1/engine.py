@@ -247,12 +247,15 @@ class Engine:
         self._stream_thread = None
 
     def _run_stream(self) -> None:
-        """Long-running thread — login, subscribe, drain the cache until stopped.
+        """Long-running thread — login, subscribe, start the blocking WebSocket loop.
 
-        ``stream.start()`` is non-blocking — it spawns its own thread
-        for the WebSocket consumer. This thread becomes the drainer:
-        it reads MarketBook batches off the listener's output queue
-        and routes each book to ``_handle_market_book``.
+        ``BetfairStream.start()`` is BLOCKING — it runs the WebSocket
+        consumer in the current thread until the stream closes. So the
+        drain loop has to run in a *separate* thread, spawned before
+        we call start(). This thread becomes the WebSocket consumer;
+        the bf-drain thread reads merged MarketBook batches off the
+        listener's output queue and routes each book through
+        ``_handle_market_book``.
         """
 
         try:
@@ -286,18 +289,39 @@ class Engine:
                 market_filter=market_filter,
                 market_data_filter=data_filter,
             )
-            self._stream.start()
+
+            # Spawn the drainer BEFORE start() blocks. The status flips
+            # to CONNECTED here because start() will not return until
+            # the stream closes; any further status update would be
+            # unreachable.
+            drain_thread = threading.Thread(
+                target=self._drain_stream_queue,
+                args=(stream_queue,),
+                name="bf-drain",
+                daemon=True,
+            )
+            drain_thread.start()
             self._stream_status = "CONNECTED"
-            logger.info("stream subscribed; draining MarketBook batches")
+            logger.info("stream subscribed; entering WebSocket consumer loop")
+
+            # Blocks until the stream is stopped externally.
+            self._stream.start()
+            logger.info("WebSocket consumer loop exited")
         except Exception as exc:
             logger.exception("stream thread failed: %s", exc)
             self._stream_status = "ERROR"
             self._push_event(
                 "error", {"detail": f"stream connect failed: {exc}"}
             )
-            return
 
-        # Drain loop — runs in this thread until shutdown.
+    def _drain_stream_queue(self, stream_queue: "Queue") -> None:
+        """Consume merged MarketBook batches from the listener queue.
+
+        Runs in its own thread because the stream's start() blocks the
+        thread that calls it. Each batch is a list of MarketBook objects
+        — one per market that changed in this update window.
+        """
+
         batches = 0
         while not self._stop_flag.is_set():
             try:
