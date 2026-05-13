@@ -156,6 +156,16 @@ class Engine:
         self._account_exposure: float = 0.0
         self._placed: list[PlacedBet] = []
         self._started_at: Optional[str] = None
+        # bet_id → {market_name, venue, race_time, runner_name, rule_applied}.
+        # Populated in _place_real so _poll_settlement can hydrate the
+        # SettledBet rows with full context (Betfair's list_cleared_orders
+        # response only carries bet_id / selection_id / price / size / outcome
+        # — not market_name, venue, race_time, or rule_applied).
+        self._placement_context: dict[str, dict[str, Any]] = {}
+        # Hydrate from today's persisted placements so the cache survives
+        # a Cloud Run cold start (settlement can land hours after placement
+        # for evening races).
+        self._rehydrate_placement_context()
 
     # ── Public API used by main.py ─────────────────────────────────────
 
@@ -300,6 +310,34 @@ class Engine:
         except Exception as exc:  # noqa: BLE001
             logger.warning("account refresh failed: %s", exc)
 
+    def _rehydrate_placement_context(self) -> None:
+        """Rebuild the bet_id → context cache from today's persisted placements.
+
+        Called on engine boot so settlement landing after a Cloud Run
+        restart can still hydrate the rich SettledBet fields. Each
+        placement row carries market_id + runner_name + rule_applied,
+        and we look up market_name / venue / race_time from today's
+        evaluations (keyed by market_id).
+        """
+
+        snapshot = self._results.snapshot()
+        evals_by_market = {
+            e.get("market_id"): e for e in snapshot.get("evaluations", [])
+        }
+        for placement in snapshot.get("placements", []):
+            bet_id = placement.get("bet_id")
+            if not bet_id:
+                continue
+            ev = evals_by_market.get(placement.get("market_id"), {})
+            self._placement_context[bet_id] = {
+                "market_id": placement.get("market_id", ""),
+                "market_name": ev.get("market_name", ""),
+                "venue": ev.get("venue", ""),
+                "race_time": ev.get("race_time", ""),
+                "runner_name": placement.get("runner_name", ""),
+                "rule_applied": placement.get("rule_applied", ""),
+            }
+
     # ── Per-market handling ────────────────────────────────────────────
 
     def _handle_market_book(self, book) -> None:  # type: ignore[no-untyped-def]
@@ -374,6 +412,18 @@ class Engine:
                 self._placed.append(placed)
                 self._results.append_placement(placed.to_dict())
                 self._push_event("placement", placed.to_dict())
+                # Cache the rich context so _poll_settlement can hydrate
+                # the SettledBet — Betfair's list_cleared_orders doesn't
+                # carry market_name / venue / race_time / rule_applied.
+                if bet_id:
+                    self._placement_context[bet_id] = {
+                        "market_id": result.market_id,
+                        "market_name": result.market_name,
+                        "venue": result.venue,
+                        "race_time": result.race_time,
+                        "runner_name": instr.runner_name,
+                        "rule_applied": instr.rule_applied,
+                    }
             except Exception as exc:
                 logger.exception("place_orders failed: %s", exc)
                 self._push_event(
@@ -452,14 +502,17 @@ class Engine:
             elif order.bet_outcome == "LOST":
                 outcome = "LOST"
                 pnl = float(order.profit or 0)
+            # Hydrate context from the placement cache (populated when the
+            # bet was placed, or rehydrated from today's placements on boot).
+            ctx = self._placement_context.get(bet_id, {})
             settled = SettledBet(
-                market_id=str(order.market_id),
-                market_name="",
-                venue="",
-                race_time="",
+                market_id=ctx.get("market_id") or str(order.market_id),
+                market_name=ctx.get("market_name", ""),
+                venue=ctx.get("venue", ""),
+                race_time=ctx.get("race_time", ""),
                 selection_id=int(order.selection_id),
-                runner_name="",
-                rule_applied="",
+                runner_name=ctx.get("runner_name", ""),
+                rule_applied=ctx.get("rule_applied", ""),
                 side=order.side or "LAY",
                 price=float(order.price_matched or 0),
                 stake=float(order.size_settled or 0),
