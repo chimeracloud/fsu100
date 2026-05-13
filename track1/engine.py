@@ -132,7 +132,12 @@ class Engine:
         self._stream = None
         self._stream_thread: Optional[threading.Thread] = None
         self._stream_status = "DISCONNECTED"
-        self._evaluated_markets: set[str] = set()
+        # market_id → race_time ISO string. Dict (not set) so we can
+        # filter the "markets today" counter by race date — in DRY_RUN
+        # the engine evaluates tomorrow's markets too once the upper
+        # window bound is lifted, but the operator's session is the
+        # UTC trading day, not the lifetime of the process.
+        self._evaluated_markets: dict[str, str] = {}
         # Event queue consumed by the SSE endpoint. Bounded so a slow
         # client cannot starve memory.
         self._events: Queue[dict[str, Any]] = Queue(maxsize=2000)
@@ -177,13 +182,33 @@ class Engine:
         self._settings = new_settings
 
     def status(self) -> dict[str, Any]:
+        today_prefix = datetime.now(tz=timezone.utc).strftime("%Y-%m-%d")
+        # Count only markets whose race_time falls on today's UTC date.
+        # Anything without a race_time falls through and counts (rare —
+        # only happens if the stream omitted market_definition.market_time).
+        markets_today = sum(
+            1
+            for rt in self._evaluated_markets.values()
+            if (not rt) or rt.startswith(today_prefix)
+        )
+        # Same date filter for placements — race_time is on the
+        # placement-context cache. Placements without a known race_time
+        # count (shouldn't happen in practice).
+        bets_placed_today = 0
+        for placed in self._placed:
+            ctx = self._placement_context.get(placed.bet_id or "", {})
+            rt = ctx.get("race_time", "") or self._evaluated_markets.get(
+                placed.market_id, ""
+            )
+            if (not rt) or rt.startswith(today_prefix):
+                bets_placed_today += 1
         return {
             "service": "fsu100-track1",
             "version": "1.0.0",
             "mode": self._settings.general.mode.value,
             "stream_status": self._stream_status,
-            "markets_today": len(self._evaluated_markets),
-            "bets_placed": len(self._placed),
+            "markets_today": markets_today,
+            "bets_placed": bets_placed_today,
             "pnl_today": self._results.summary().get("total_pnl", 0.0),
             "account_balance": self._account_balance,
             "account_exposure": self._account_exposure,
@@ -485,7 +510,7 @@ class Engine:
 
         snapshot = _snapshot_from_book(book, self._runner_names.get(market_id))
         result = evaluate(snapshot, self._settings)
-        self._evaluated_markets.add(market_id)
+        self._evaluated_markets[market_id] = snapshot.race_time
         self._results.append_evaluation(result.to_dict())
         self._push_event("evaluation", result.to_dict())
 
