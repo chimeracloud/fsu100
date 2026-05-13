@@ -21,7 +21,7 @@ import tempfile
 import threading
 import time
 from datetime import datetime, timedelta, timezone
-from queue import Queue
+from queue import Empty, Queue
 from typing import Any, Iterable, Optional
 
 import betfairlightweight  # type: ignore[import-untyped]
@@ -97,34 +97,20 @@ def _build_trading() -> betfairlightweight.APIClient:
 # ──────────────────────────────────────────────────────────────────────────────
 # Stream listener — receives MarketBook updates from Betfair
 # ──────────────────────────────────────────────────────────────────────────────
-
-
-class _MarketListener(StreamListener):
-    """Drop-in StreamListener that calls ``on_market_book`` on every MCM.
-
-    betfairlightweight's default listener maintains a ``MarketCache`` so
-    we get fully-merged MarketBook objects on every update. We don't
-    override that — we just hook on_process to feed the engine.
-    """
-
-    def __init__(self, on_market_book) -> None:
-        super().__init__()
-        self._on_market_book = on_market_book
-
-    def on_process(self, output) -> None:  # type: ignore[override]
-        """Called for each batch of stream events.
-
-        ``output`` is whatever the stream emits — for the ``MARKET_SUB``
-        request the cache yields ``MarketBook`` objects. We forward
-        each one to the engine for windowing/evaluation.
-        """
-
-        super().on_process(output)
-        for book in output or []:
-            try:
-                self._on_market_book(book)
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("market book handler raised: %s", exc)
+#
+# betfairlightweight's flow is:
+#
+#   1. WebSocket sends MCM events to the listener.
+#   2. Listener routes to a MarketStream, which maintains a market cache
+#      and emits fully-merged MarketBook objects in batches.
+#   3. MarketStream puts each batch into ``listener.output_queue``.
+#   4. The caller drains the queue and processes each MarketBook.
+#
+# So we use the canonical pattern: pass an output_queue to the listener,
+# then drain it in the same thread that started the stream. Earlier code
+# subclassed StreamListener.on_process — that override is not on the
+# call path (MarketStream calls its own on_process, not the listener's)
+# so 115 markets were silently piling up in the cache with no consumer.
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -261,7 +247,13 @@ class Engine:
         self._stream_thread = None
 
     def _run_stream(self) -> None:
-        """Long-running thread — login, subscribe, listen until stopped."""
+        """Long-running thread — login, subscribe, drain the cache until stopped.
+
+        ``stream.start()`` is non-blocking — it spawns its own thread
+        for the WebSocket consumer. This thread becomes the drainer:
+        it reads MarketBook batches off the listener's output queue
+        and routes each book to ``_handle_market_book``.
+        """
 
         try:
             self._stream_status = "CONNECTING"
@@ -270,7 +262,8 @@ class Engine:
                 self._trading.login()
             self._refresh_account()
 
-            listener = _MarketListener(self._handle_market_book)
+            stream_queue: Queue = Queue()
+            listener = StreamListener(output_queue=stream_queue)
             market_filter = filters.streaming_market_filter(
                 event_type_ids=[HORSE_RACING_EVENT_TYPE],
                 country_codes=list(self._settings.general.countries),
@@ -293,14 +286,36 @@ class Engine:
                 market_filter=market_filter,
                 market_data_filter=data_filter,
             )
-            self._stream_status = "CONNECTED"
             self._stream.start()
+            self._stream_status = "CONNECTED"
+            logger.info("stream subscribed; draining MarketBook batches")
         except Exception as exc:
             logger.exception("stream thread failed: %s", exc)
             self._stream_status = "ERROR"
             self._push_event(
                 "error", {"detail": f"stream connect failed: {exc}"}
             )
+            return
+
+        # Drain loop — runs in this thread until shutdown.
+        batches = 0
+        while not self._stop_flag.is_set():
+            try:
+                output = stream_queue.get(timeout=1)
+            except Empty:
+                continue
+            if not output:
+                continue
+            batches += 1
+            if batches % 50 == 1:
+                logger.info(
+                    "stream batch %d (%d books)", batches, len(output)
+                )
+            for book in output:
+                try:
+                    self._handle_market_book(book)
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("market book handler raised: %s", exc)
 
     def _refresh_account(self) -> None:
         try:
