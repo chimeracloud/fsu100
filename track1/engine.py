@@ -400,6 +400,13 @@ class Engine:
         if market_time is None:
             return
 
+        # Betfair stream returns market_time as a naive UTC datetime.
+        # Coerce to aware so subtraction against datetime.now(tz=UTC)
+        # below doesn't raise "can't subtract offset-naive and
+        # offset-aware datetimes".
+        if market_time.tzinfo is None:
+            market_time = market_time.replace(tzinfo=timezone.utc)
+
         if market_def.in_play or market_def.status != "OPEN":
             return
 
