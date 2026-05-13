@@ -58,8 +58,9 @@ class BaseRules:
     rule2c_stake: float = 2.0
 
     rule3a_enabled: bool = True
+    rule3a_stake: float = 1.0  # lay fav + 2nd fav, this is per-instruction
     rule3b_enabled: bool = True
-    rule3_stake: float = 1.0  # shared between 3A and 3B
+    rule3b_stake: float = 1.0  # lay fav only
 
     rule2_split1: float = 3.0  # 2a / 2b boundary
     rule2_split2: float = 4.0  # 2b / 2c boundary

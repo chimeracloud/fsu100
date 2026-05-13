@@ -167,6 +167,12 @@ def apply_rules(
     rule3b_enabled: bool = True,
     rule1_stake: float = 3.0,
     rule3_stake: float = 1.0,
+    # Independent stakes for Rule 3A and Rule 3B. When None, both fall
+    # back to ``rule3_stake`` for backwards compatibility with callers
+    # that still pass the single shared value. Track 1's Settings flows
+    # both through.
+    rule3a_stake: Optional[float] = None,
+    rule3b_stake: Optional[float] = None,
     # Rule 2 sub-bands (replaces single Rule 2)
     rule2a_enabled: bool = True,   # 2.0 – split1
     rule2b_enabled: bool = True,   # split1 – split2
@@ -191,6 +197,11 @@ def apply_rules(
       - Fav odds > 5.0 AND gap to 2nd fav < 2 → £1 lay fav + £1 lay 2nd fav
       - Fav odds > 5.0 AND gap to 2nd fav ≥ 2 → £1 lay fav only
     """
+    # Resolve effective Rule 3 stakes — new split-stake params take
+    # precedence over the legacy single ``rule3_stake``.
+    _rule3a_stake = rule3a_stake if rule3a_stake is not None else rule3_stake
+    _rule3b_stake = rule3b_stake if rule3b_stake is not None else rule3_stake
+
     result = RuleResult(
         market_id=market_id,
         market_name=market_name,
@@ -340,17 +351,18 @@ def apply_rules(
         # Need second favourite to calculate gap
         if second_fav is None:
             # No second favourite — treat as 3B (single lay on favourite)
-            if not rule3b_enabled:
+            if not rule3b_enabled or _rule3b_stake <= 0:
                 result.skipped = True
-                result.skip_reason = f"Rule 3B disabled (fav odds {odds} > 5.0, no 2nd fav)"
+                reason = "disabled" if not rule3b_enabled else "stake=0 (skip band)"
+                result.skip_reason = f"Rule 3B {reason} (fav odds {odds} > 5.0, no 2nd fav)"
                 return result
-            result.rule_applied = f"RULE_3B: Fav odds {odds} > 5.0, no 2nd fav → £{rule3_stake} lay fav only"
+            result.rule_applied = f"RULE_3B: Fav odds {odds} > 5.0, no 2nd fav → £{_rule3b_stake} lay fav only"
             result.instructions.append(LayInstruction(
                 market_id=market_id,
                 selection_id=fav.selection_id,
                 runner_name=fav.runner_name,
                 price=odds,
-                size=rule3_stake,
+                size=_rule3b_stake,
                 rule_applied="RULE_3B_NO_SECOND_FAV",
             ))
             return result
@@ -358,21 +370,22 @@ def apply_rules(
         # fav_gap already computed (not None since second_fav is not None)
         if fav_gap < rule3_gap_threshold:
             # Gap < threshold → stake on fav + stake on 2nd fav (Rule 3A)
-            if not rule3a_enabled:
+            if not rule3a_enabled or _rule3a_stake <= 0:
                 result.skipped = True
-                result.skip_reason = f"Rule 3A disabled (fav odds {odds} > 5.0, gap {fav_gap:.2f} < {rule3_gap_threshold})"
+                reason = "disabled" if not rule3a_enabled else "stake=0 (skip band)"
+                result.skip_reason = f"Rule 3A {reason} (fav odds {odds} > 5.0, gap {fav_gap:.2f} < {rule3_gap_threshold})"
                 return result
             rule_tag = "RULE_3_JOINT" if close_odds else "RULE_3A"
             result.rule_applied = (
                 f"{rule_tag}: Fav odds {odds} > 5.0, gap {fav_gap:.2f} < {rule3_gap_threshold} "
-                f"→ £{rule3_stake} fav + £{rule3_stake} 2nd fav"
+                f"→ £{_rule3a_stake} fav + £{_rule3a_stake} 2nd fav"
             )
             result.instructions.append(LayInstruction(
                 market_id=market_id,
                 selection_id=fav.selection_id,
                 runner_name=fav.runner_name,
                 price=odds,
-                size=rule3_stake,
+                size=_rule3a_stake,
                 rule_applied=f"{rule_tag}_FAV",
             ))
             result.instructions.append(LayInstruction(
@@ -380,27 +393,28 @@ def apply_rules(
                 selection_id=second_fav.selection_id,
                 runner_name=second_fav.runner_name,
                 price=second_fav.best_available_to_lay,
-                size=rule3_stake,
+                size=_rule3a_stake,
                 rule_applied=f"{rule_tag}_2ND",
             ))
             return result
 
         else:
             # Gap ≥ threshold → stake on fav only (Rule 3B)
-            if not rule3b_enabled:
+            if not rule3b_enabled or _rule3b_stake <= 0:
                 result.skipped = True
-                result.skip_reason = f"Rule 3B disabled (fav odds {odds} > 5.0, gap {fav_gap:.2f} ≥ {rule3_gap_threshold})"
+                reason = "disabled" if not rule3b_enabled else "stake=0 (skip band)"
+                result.skip_reason = f"Rule 3B {reason} (fav odds {odds} > 5.0, gap {fav_gap:.2f} ≥ {rule3_gap_threshold})"
                 return result
             result.rule_applied = (
                 f"RULE_3B: Fav odds {odds} > 5.0, gap {fav_gap:.2f} ≥ {rule3_gap_threshold} "
-                f"→ £{rule3_stake} fav only"
+                f"→ £{_rule3b_stake} fav only"
             )
             result.instructions.append(LayInstruction(
                 market_id=market_id,
                 selection_id=fav.selection_id,
                 runner_name=fav.runner_name,
                 price=odds,
-                size=rule3_stake,
+                size=_rule3b_stake,
                 rule_applied="RULE_3B_WIDE_GAP",
             ))
             return result
