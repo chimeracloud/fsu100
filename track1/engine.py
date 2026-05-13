@@ -138,6 +138,13 @@ class Engine:
         # window bound is lifted, but the operator's session is the
         # UTC trading day, not the lifetime of the process.
         self._evaluated_markets: dict[str, str] = {}
+        # market_ids the engine has already placed REAL (non-simulated)
+        # bets on. NEVER cleared during a session, even on mode change
+        # — Track 1 will not lay the same market twice, period. The
+        # operator must restart the container (or wait for tomorrow's
+        # session) to bet on the same market again. Hydrated on boot
+        # from today's persisted placements where simulated=False.
+        self._placed_markets: set[str] = set()
         # Event queue consumed by the SSE endpoint. Bounded so a slow
         # client cannot starve memory.
         self._events: Queue[dict[str, Any]] = Queue(maxsize=2000)
@@ -221,13 +228,18 @@ class Engine:
 
         ``action`` is one of ``start`` (DRY_RUN), ``live``, ``stop``.
 
-        Clears the in-memory dedup set on every action so a mode change
-        re-evaluates every market still in the stream cache. Without
-        this, DRY_RUN's window bypass evaluates markets 1-2h before
-        off; switching to LIVE leaves those market_ids in the dedup
-        set, so when they finally enter the T-5min LIVE window the
-        engine skips them and no bets fire. Clearing the set is the
-        operator's "fresh session from here" signal.
+        Clears the per-evaluation dedup set on every action so a mode
+        change re-evaluates every market still in the stream cache.
+        Without this, DRY_RUN's window bypass evaluates markets 1-2h
+        before off; switching to LIVE would leave those market_ids
+        in the dedup set, so when they finally enter the T-5min LIVE
+        window the engine would skip them and no bets fire.
+
+        DOES NOT clear ``_placed_markets`` — that's the permanent
+        "we've already laid this market in LIVE" guard, and it must
+        persist across mode toggles so the same market can't be
+        double-bet by toggling START/LIVE/STOP rapidly. Only a
+        container restart (or a new trading day) resets it.
         """
 
         action = (action or "").lower()
@@ -452,6 +464,13 @@ class Engine:
             e.get("market_id"): e for e in snapshot.get("evaluations", [])
         }
         for placement in snapshot.get("placements", []):
+            # Rebuild the permanent _placed_markets guard from today's
+            # real placements so a Cloud Run restart doesn't reset the
+            # "already bet on" memory.
+            if not placement.get("simulated", True):
+                mid = placement.get("market_id")
+                if mid:
+                    self._placed_markets.add(mid)
             bet_id = placement.get("bet_id")
             if not bet_id:
                 continue
@@ -479,6 +498,14 @@ class Engine:
             return
         market_id = getattr(book, "market_id", None)
         if not market_id or market_id in self._evaluated_markets:
+            return
+        # In LIVE: an additional permanent guard so a market can never
+        # be bet on twice in the same session, regardless of mode
+        # toggling (which clears _evaluated_markets but not this set).
+        if (
+            self._settings.general.mode == Mode.LIVE
+            and market_id in self._placed_markets
+        ):
             return
 
         market_def = getattr(book, "market_definition", None)
@@ -594,6 +621,11 @@ class Engine:
             self._placed.append(placed)
             self._results.append_placement(placed.to_dict())
             self._push_event("placement", placed.to_dict())
+            # Permanent dedup for this session — irrespective of whether
+            # Betfair accepted or rejected, we won't try this market
+            # again in LIVE mode (avoids spamming a market with retries
+            # on failure too).
+            self._placed_markets.add(result.market_id)
 
             if instruction_status == "FAILURE" or overall_status == "FAILURE":
                 logger.warning(
