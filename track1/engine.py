@@ -148,6 +148,18 @@ class Engine:
         # response only carries bet_id / selection_id / price / size / outcome
         # — not market_name, venue, race_time, or rule_applied).
         self._placement_context: dict[str, dict[str, Any]] = {}
+        # market_id → {selection_id: runner_name}. The stream's
+        # MarketDefinition.runners often arrives without runner names
+        # (especially in the first few updates per market), so the
+        # evaluator would see "selection_12345" placeholders. We fix
+        # this by calling list_market_catalogue once per market on
+        # first sight and caching the names here. Subsequent snapshots
+        # of the same market use the cached names verbatim.
+        self._runner_names: dict[str, dict[int, str]] = {}
+        # Track which markets we've already attempted a catalogue fetch
+        # for, so we don't hammer the REST API on every market book
+        # update (we get ~hundreds of updates per market per session).
+        self._catalogue_fetched: set[str] = set()
         # Hydrate from today's persisted placements so the cache survives
         # a Cloud Run cold start (settlement can land hours after placement
         # for evening races).
@@ -349,6 +361,43 @@ class Engine:
         except Exception as exc:  # noqa: BLE001
             logger.warning("account refresh failed: %s", exc)
 
+    def _fetch_runner_names(self, market_id: str) -> None:
+        """Look up human-readable runner names for a market via REST.
+
+        The streaming feed's MarketDefinition.runners frequently lacks
+        the ``name`` field on early updates, so a market book on first
+        sight may only carry selection_ids. We call list_market_catalogue
+        once per market and cache the names. This is rate-limit-friendly
+        because we evaluate each market exactly once anyway (then it
+        sits in ``_evaluated_markets``).
+        """
+
+        if market_id in self._catalogue_fetched:
+            return
+        self._catalogue_fetched.add(market_id)
+        try:
+            catalogue = self._trading.betting.list_market_catalogue(
+                filter={"marketIds": [market_id]},
+                market_projection=["RUNNER_DESCRIPTION"],
+                max_results=1,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("list_market_catalogue(%s) failed: %s", market_id, exc)
+            return
+        if not catalogue:
+            return
+        names: dict[int, str] = {}
+        for runner in catalogue[0].runners or []:
+            sel_id = getattr(runner, "selection_id", None)
+            name = getattr(runner, "runner_name", None) or getattr(runner, "name", None)
+            if sel_id is not None and name:
+                names[int(sel_id)] = name
+        if names:
+            self._runner_names[market_id] = names
+            logger.info(
+                "runner names cached for %s (%d runners)", market_id, len(names)
+            )
+
     def _rehydrate_placement_context(self) -> None:
         """Rebuild the bet_id → context cache from today's persisted placements.
 
@@ -429,7 +478,12 @@ class Engine:
             if seconds_to_off > window:
                 return
 
-        snapshot = _snapshot_from_book(book)
+        # Ensure we have runner names cached for this market. Cheap if
+        # already fetched (sets-only check); REST call only the first
+        # time we see a given market_id this session.
+        self._fetch_runner_names(market_id)
+
+        snapshot = _snapshot_from_book(book, self._runner_names.get(market_id))
         result = evaluate(snapshot, self._settings)
         self._evaluated_markets.add(market_id)
         self._results.append_evaluation(result.to_dict())
@@ -599,17 +653,27 @@ class Engine:
 # ──────────────────────────────────────────────────────────────────────────────
 
 
-def _snapshot_from_book(book) -> MarketSnapshot:  # type: ignore[no-untyped-def]
-    """Convert a betfairlightweight ``MarketBook`` to a :class:`MarketSnapshot`."""
+def _snapshot_from_book(
+    book, runner_name_override: dict[int, str] | None = None
+) -> MarketSnapshot:  # type: ignore[no-untyped-def]
+    """Convert a betfairlightweight ``MarketBook`` to a :class:`MarketSnapshot`.
+
+    ``runner_name_override`` is the catalogue cache (selection_id → name)
+    populated by ``Engine._fetch_runner_names``. When supplied, names
+    from the catalogue take priority over names from the stream's
+    MarketDefinition (which often arrive blank or as placeholders).
+    """
 
     md = book.market_definition
     runners_md = {r.selection_id: r for r in (md.runners or [])}
+    override = runner_name_override or {}
 
     runners: list[Runner] = []
     for r in book.runners:
         meta = runners_md.get(r.selection_id)
         name = (
-            getattr(meta, "name", None)
+            override.get(r.selection_id)
+            or getattr(meta, "name", None)
             or getattr(meta, "runner_name", None)
             or f"selection_{r.selection_id}"
         )
