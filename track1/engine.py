@@ -160,6 +160,18 @@ class Engine:
         # response only carries bet_id / selection_id / price / size / outcome
         # — not market_name, venue, race_time, or rule_applied).
         self._placement_context: dict[str, dict[str, Any]] = {}
+        # Cached count of today's GB/IE WIN markets on Betfair. Refreshed
+        # via list_market_catalogue every ~5 min by the settle loop so
+        # the operator can cross-check "Betfair sees N markets, Chimera
+        # sees M markets". Mark's pain point — historic engines missed
+        # markets when Betfair's REST API hiccupped; this lets us notice.
+        self._betfair_markets_today: int = 0
+        self._betfair_markets_at: Optional[str] = None
+        # Bet-id verification: after placement we call list_current_orders
+        # to confirm Betfair has the order. Anything not verified within
+        # the polling window gets flagged so the operator can investigate.
+        self._verified_bet_ids: set[str] = set()
+        self._unverified_bet_ids: set[str] = set()
         # market_id → {selection_id: runner_name}. The stream's
         # MarketDefinition.runners often arrives without runner names
         # (especially in the first few updates per market), so the
@@ -214,8 +226,15 @@ class Engine:
             "version": "1.0.0",
             "mode": self._settings.general.mode.value,
             "stream_status": self._stream_status,
+            # Chimera-side market count (engine processed)
             "markets_today": markets_today,
+            "chimera_markets_today": markets_today,
+            # Betfair-side market count (catalogue, refreshed periodically)
+            "betfair_markets_today": self._betfair_markets_today,
+            "betfair_markets_at": self._betfair_markets_at,
             "bets_placed": bets_placed_today,
+            "bets_verified": len(self._verified_bet_ids),
+            "bets_unverified": len(self._unverified_bet_ids),
             "pnl_today": self._results.summary().get("total_pnl", 0.0),
             "account_balance": self._account_balance,
             "account_exposure": self._account_exposure,
@@ -353,6 +372,7 @@ class Engine:
                 self._trading = _build_trading()
                 self._trading.login()
             self._refresh_account()
+            self._refresh_betfair_market_count()
 
             stream_queue: Queue = Queue()
             listener = StreamListener(output_queue=stream_queue)
@@ -437,6 +457,69 @@ class Engine:
             self._account_exposure = float(funds.exposure or 0)
         except Exception as exc:  # noqa: BLE001
             logger.warning("account refresh failed: %s", exc)
+
+    def _refresh_betfair_market_count(self) -> None:
+        """Pull today's GB/IE WIN market count from Betfair.
+
+        Used to cross-check against the engine's own market count
+        (Mark's pain point — historic engines missed markets when
+        REST hiccupped). Updates ``_betfair_markets_today`` + a
+        timestamp. Failure is non-fatal — the previous value sticks
+        and the timestamp records when we last got fresh data.
+        """
+
+        if self._trading is None:
+            return
+        try:
+            today_start = datetime.now(tz=timezone.utc).replace(
+                hour=0, minute=0, second=0, microsecond=0
+            )
+            tomorrow_start = today_start + timedelta(days=1)
+            catalogue = self._trading.betting.list_market_catalogue(
+                filter={
+                    "eventTypeIds": [HORSE_RACING_EVENT_TYPE],
+                    "marketCountries": list(self._settings.general.countries),
+                    "marketTypeCodes": ["WIN"],
+                    "marketStartTime": {
+                        "from": today_start.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                        "to": tomorrow_start.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                    },
+                },
+                max_results=1000,
+            )
+            self._betfair_markets_today = len(catalogue or [])
+            self._betfair_markets_at = _iso_now()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("betfair market count refresh failed: %s", exc)
+
+    def _verify_bet(self, bet_id: str) -> bool:
+        """Confirm a freshly placed bet is reachable via list_current_orders.
+
+        Called immediately after a successful ``place_orders`` so we
+        catch Betfair API hiccups where the response said success but
+        the order didn't land. Returns True if Betfair returns the
+        bet_id; False otherwise. Records into the verified / unverified
+        sets so the status endpoint can surface the counts.
+        """
+
+        if self._trading is None or not bet_id:
+            return False
+        try:
+            current = self._trading.betting.list_current_orders(
+                bet_ids=[bet_id]
+            )
+            orders = getattr(current, "orders", None) or []
+            found = any(getattr(o, "bet_id", None) == bet_id for o in orders)
+            if found:
+                self._verified_bet_ids.add(bet_id)
+                self._unverified_bet_ids.discard(bet_id)
+                return True
+            self._unverified_bet_ids.add(bet_id)
+            return False
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("bet verification failed for %s: %s", bet_id, exc)
+            self._unverified_bet_ids.add(bet_id)
+            return False
 
     def _fetch_runner_names(self, market_id: str) -> None:
         """Look up human-readable runner names for a market via REST.
@@ -678,6 +761,21 @@ class Engine:
                     "runner_name": instr.runner_name,
                     "rule_applied": instr.rule_applied,
                 }
+                # Verify the bet is reachable on Betfair right now.
+                # Sync call; adds ~200ms latency per bet but catches
+                # silent failures immediately.
+                if not self._verify_bet(bet_id):
+                    self._push_event(
+                        "error",
+                        {
+                            "market_id": result.market_id,
+                            "bet_id": bet_id,
+                            "detail": (
+                                f"placement returned bet_id {bet_id} but "
+                                "list_current_orders couldn't find it on Betfair"
+                            ),
+                        },
+                    )
 
     def _place_simulated(self, result: EvaluationResult) -> None:
         for instr in result.instructions:
@@ -700,7 +798,11 @@ class Engine:
     # ── Settlement loop ────────────────────────────────────────────────
 
     def _run_settle_loop(self) -> None:
-        """Poll list_cleared_orders every 5 minutes, mark settled bets."""
+        """Poll list_cleared_orders every 5 minutes, mark settled bets.
+
+        Also refreshes the Betfair-side market count so the operator
+        can cross-check Chimera vs Betfair on the status panel.
+        """
 
         while not self._stop_flag.is_set():
             try:
@@ -710,6 +812,7 @@ class Engine:
                 ):
                     self._poll_settlement()
                     self._refresh_account()
+                    self._refresh_betfair_market_count()
             except Exception as exc:  # noqa: BLE001
                 logger.warning("settle loop raised: %s", exc)
             self._stop_flag.wait(timeout=300)  # 5 min
