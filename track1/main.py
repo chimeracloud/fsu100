@@ -34,7 +34,7 @@ from sse_starlette.sse import EventSourceResponse
 
 from engine import Engine
 from gcs import TradingStore, load_results_for_date, load_settings, save_settings
-from settings import Settings
+from settings import Mode, Settings
 
 logging.basicConfig(
     level=logging.INFO,
@@ -61,8 +61,17 @@ async def lifespan(app: FastAPI):
     if persisted:
         try:
             restored = Settings.from_dict(persisted)
+            # SAFETY: never auto-resume an active mode after a restart.
+            # If the previous session was running DRY_RUN or LIVE and
+            # the container restarts (deploy, scale event, crash), the
+            # operator MUST explicitly hit START or GO LIVE again. This
+            # prevents the engine from silently picking up where it
+            # left off mid-race — a real footgun observed 2026-05-14.
+            restored.general.mode = Mode.STOPPED
             engine.replace_settings(restored)
-            logger.info("CLE V2 engine ready — settings restored from GCS")
+            logger.info(
+                "CLE V2 engine ready — settings restored from GCS, mode forced to STOPPED"
+            )
         except Exception as exc:  # noqa: BLE001
             logger.warning(
                 "persisted settings failed validation — using defaults: %s", exc,

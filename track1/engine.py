@@ -673,6 +673,14 @@ class Engine:
             self._place_simulated(result)
 
     def _place_real(self, result: EvaluationResult) -> None:
+        # CRITICAL SAFETY: mark the market as "placed-on" BEFORE the
+        # HTTP call. If anything between here and the response — network
+        # exception, response parsing error, container restart — drops
+        # the local tracking, the market is still guarded against
+        # re-betting because _placed_markets contains the id. Without
+        # this, a partial failure mid-loop could leave the market open
+        # to re-evaluation on the next book update.
+        self._placed_markets.add(result.market_id)
         for instr in result.instructions:
             # The Betfair HTTP call happens BEFORE we try to parse the
             # response. Split the two so a parsing error doesn't leave
