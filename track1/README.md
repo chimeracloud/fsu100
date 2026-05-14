@@ -93,10 +93,11 @@ downstream steps when they skip / block.
 | Signals | Overround / Field Size / Steam Gate / Band Performance | OFF |
 | Risk Overlay | TOP2 Concentration / Market Overlay (MOM) | OFF |
 
-**Operating gotcha — settings do not persist across redeploy yet.** A
-Cloud Run cold start reverts every setting to the defaults above. This
-is on the immediate fix list. Until then, re-apply any custom settings
-after every deploy or container restart.
+Settings persist to GCS at `gs://chiops-clev2-trading/settings/current.json`
+on every successful `PUT /admin/config`. The lifespan handler restores
+them on boot, so a redeploy or cold start no longer reverts your tuning.
+Default values above are used only on first boot when the file doesn't
+exist yet, or as a fallback if a persisted file fails validation.
 
 ---
 
@@ -119,36 +120,35 @@ GET  /ready                                 readiness probe
 
 ---
 
-## Data storage — open for review
+## Data storage
 
-**Current state — single GCS bucket, single prefix.**
+All CLE V2 trading data lives under one bucket:
+**`gs://chiops-clev2-trading/`** (region `europe-west2`). The fsu100
+service account has `roles/storage.objectAdmin` on it.
 
-| What | Where |
+| Path | Written by | Contents |
+|---|---|---|
+| `daily/{YYYY-MM-DD}.json` | every evaluation, placement, settlement | Full timeline of the day's session — what the engine saw, what it decided, what it placed, what settled |
+| `settled/{YYYY-MM-DD}.json` | every Betfair-confirmed settlement | Subset of daily — only the rows that came back from `list_cleared_orders`. Useful for audit / P&L reconciliation |
+| `errors/{YYYY-MM-DD}.json` | every error event from `_push_event("error", ...)` | Post-session error log. Placement failures, stream issues, anything that fired an error |
+| `snapshots/{YYYY-MM-DD}_start.json` | first STOPPED → DRY_RUN/LIVE transition | Engine status at session start (balance, settings, mode) |
+| `snapshots/{YYYY-MM-DD}_end.json` | active → STOPPED transition | Engine status at session end. Lets you diff against `_start.json` |
+| `markets/{YYYY-MM-DD}_catalogue.json` | flushed on session end | Per-market runner names + race_time. Built from the `list_market_catalogue` cache |
+| `settings/current.json` | every successful `PUT /admin/config` | Latest operator settings. Single file, latest-wins. Restored on lifespan startup. |
+
+Each writer rewrites the whole file in full on every call — no
+streaming append. The cost is a few bytes per write; the benefit is
+zero risk of partial-write corruption.
+
+### Other persistence
+
+| Item | Where |
 |---|---|
-| Daily results (evaluations + placements + settlements) | `gs://chiops-fsu100-results/track1/daily/{YYYY-MM-DD}.json` |
 | Cloud Run application logs | Cloud Logging (project `chiops`, service `fsu100-track1`) |
-| Settings | **in-memory only** (lost on redeploy or restart) |
-| Placement context cache | **in-memory only**, rehydrated from today's daily JSON on boot |
-| Runner-name catalogue cache | **in-memory only**, rebuilt on demand via `list_market_catalogue` |
+| Placement context cache | In-memory, rehydrated from today's daily JSON on boot |
+| Runner-name catalogue cache | In-memory, written to `markets/{date}_catalogue.json` on session end |
+| `_placed_markets` permanent dedup | In-memory, rehydrated from today's daily JSON on boot (any `placement` row where `simulated=False`) |
 | Betfair credentials | Secret Manager (`chiops` project) — `betfair-{username, password, app-key, cert-pem, key-pem}` |
-
-**Decisions pending before CLE V2 production starts:**
-
-1. **Bucket prefix.** Current `track1/` reflects the Track-1 branding from
-   the initial brief. Options to consolidate under CLE V2:
-   - Keep current: `gs://chiops-fsu100-results/track1/...` (zero migration cost)
-   - Rename prefix: `gs://chiops-fsu100-results/clev2/...` (cosmetic, requires code patch + Cloud Build rebuild)
-   - New bucket: `gs://chiops-cle-v2-results/...` (cleanest separation; needs SA permissions + lifecycle policy)
-2. **Settings persistence.** Should land before any other repair work
-   so operator tunings survive deploys. Proposed location:
-   `gs://chiops-fsu100-results/clev2/settings/current.json`. Persist
-   on every `PUT /admin/config`; hydrate on lifespan startup.
-3. **Audit log of bet placements.** Currently embedded in the daily JSON;
-   may want a separate immutable append-only log for compliance, e.g.
-   `gs://chiops-fsu100-results/clev2/audit/{date}.jsonl`.
-
-Charles will confirm location strategy before the next round of changes.
-Until then the engine continues writing to `track1/daily/`.
 
 ---
 
@@ -193,21 +193,26 @@ open Betfair positions untouched (they settle naturally via Betfair).
 
 ## Known gaps (track on these before scaling exposure)
 
-1. **Settings persistence.** Top priority. Currently in-memory only.
-2. **Visible SAVE confirmation.** UI shows the save attempt but doesn't
-   confirm round-trip success; operators have been bitten by silent
-   reverts on refresh.
-3. **Steam Gate** & **Band Performance** signals require session
-   history Track 1 doesn't yet collect. They silently no-op rather
+1. **Steam Gate** & **Band Performance** signals require session
+   history CLE V2 doesn't yet collect. They silently no-op rather
    than function. Leave both OFF until wired.
-4. **No backtest harness inside CLE V2 yet.** Tuning is happening in
+2. **No backtest harness inside CLE V2 yet.** Tuning is happening in
    the legacy `charles-ascot/lay-engine` backtest UI. Strategy modules
    are no longer byte-identical between the two (independent 3A/3B
    stakes added to CLE V2 only) — port if needed.
-5. **Pre-existing bets without local context** (e.g. errored placements
+3. **Pre-existing bets without local context** (e.g. errored placements
    from before the response-parsing fix) will settle on Betfair with
    correct P&L, but their `SettledBet` row in the daily JSON will show
    blank `market_name` / `venue` / `runner_name`.
+
+### Recently closed
+
+- ✅ Settings persistence (gs://chiops-clev2-trading/settings/current.json)
+- ✅ Visible SAVE confirmation (transient "✓ SAVED HH:MM:SS" pill in the panel)
+- ✅ Bucket switch from `chiops-fsu100-results/track1/` to `chiops-clev2-trading/`
+- ✅ Permanent per-market placement guard (no duplicate bets on mode toggle)
+- ✅ `place_orders` response parsing fix (correct `place_instruction_reports` attribute)
+- ✅ Independent Rule 3A / 3B stakes
 
 ---
 
