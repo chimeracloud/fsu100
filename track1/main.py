@@ -33,7 +33,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from sse_starlette.sse import EventSourceResponse
 
 from engine import Engine
-from gcs import DailyResults, load_results_for_date
+from gcs import TradingStore, load_results_for_date, load_settings, save_settings
 from settings import Settings
 
 logging.basicConfig(
@@ -50,16 +50,31 @@ _DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 async def lifespan(app: FastAPI):
     # Build the engine on startup. It stays in STOPPED mode until the
     # operator hits POST /admin/control/start.
-    results = DailyResults()
+    results = TradingStore()
     engine = Engine(results)
     app.state.engine = engine
     app.state.results = results
-    logger.info("track1 engine ready (mode=STOPPED)")
+
+    # Restore persisted settings if they exist (settings/current.json).
+    # First boot has no file → use the Settings dataclass defaults.
+    persisted = load_settings()
+    if persisted:
+        try:
+            restored = Settings.from_dict(persisted)
+            engine.replace_settings(restored)
+            logger.info("CLE V2 engine ready — settings restored from GCS")
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "persisted settings failed validation — using defaults: %s", exc,
+            )
+    else:
+        logger.info("CLE V2 engine ready — using default settings (no persisted file)")
+
     try:
         yield
     finally:
         engine.shutdown()
-        logger.info("track1 engine shut down")
+        logger.info("CLE V2 engine shut down")
 
 
 app = FastAPI(
@@ -103,15 +118,35 @@ async def get_config() -> dict[str, Any]:
 
 @app.put("/admin/config", tags=["admin"])
 async def put_config(payload: dict[str, Any] = Body(...)) -> dict[str, Any]:
-    """Replace the current settings. Tolerates partial dicts — anything
-    not supplied falls back to the dataclass default."""
+    """Replace the current settings.
+
+    Persists to ``gs://chiops-clev2-trading/settings/current.json``
+    before updating the in-memory engine. If GCS write fails we
+    return 500 and DO NOT update the engine — operator must see
+    that the change didn't stick. Survives redeploys via the
+    lifespan loader.
+    """
 
     try:
         new_settings = Settings.from_dict(payload)
     except Exception as exc:  # noqa: BLE001
-        raise HTTPException(status_code=400, detail=f"invalid settings: {exc}") from exc
+        raise HTTPException(
+            status_code=400, detail=f"invalid settings: {exc}",
+        ) from exc
+
+    settings_dict = new_settings.to_dict()
+    if not save_settings(settings_dict):
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                "settings did not persist to GCS — engine NOT updated. "
+                "Retry; if the error persists, check GCS health and SA "
+                "permissions on gs://chiops-clev2-trading/."
+            ),
+        )
+
     app.state.engine.replace_settings(new_settings)
-    return new_settings.to_dict()
+    return {"settings": settings_dict, "persisted": True}
 
 
 @app.post("/admin/control/{action}", tags=["admin"])

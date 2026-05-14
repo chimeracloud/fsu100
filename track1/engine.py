@@ -243,6 +243,7 @@ class Engine:
         """
 
         action = (action or "").lower()
+        previous_mode = self._settings.general.mode
         if action == "start":
             self._settings.general.mode = Mode.DRY_RUN
             self._evaluated_markets.clear()
@@ -260,7 +261,32 @@ class Engine:
             self._stop_stream()
         else:
             raise ValueError(f"unknown action: {action!r}")
+
+        # Session snapshots — written to GCS so we have a permanent
+        # record of how the engine looked at session start and end.
+        # "start" = STOPPED → DRY_RUN or LIVE (first time the engine
+        # came alive today). "end" = DRY_RUN or LIVE → STOPPED.
+        current_mode = self._settings.general.mode
+        if previous_mode == Mode.STOPPED and current_mode != Mode.STOPPED:
+            self._results.write_snapshot(self.status(), kind="start")
+        elif previous_mode != Mode.STOPPED and current_mode == Mode.STOPPED:
+            self._results.write_snapshot(self.status(), kind="end")
+            # End of session — also flush today's catalogue.
+            self._persist_catalogue()
+
         return self.status()
+
+    def _persist_catalogue(self) -> None:
+        """Write today's market catalogue (runner names + venue per market) to GCS."""
+
+        catalogue: dict[str, Any] = {}
+        for market_id, race_time in self._evaluated_markets.items():
+            catalogue[market_id] = {
+                "race_time": race_time,
+                "runners": dict(self._runner_names.get(market_id, {})),
+            }
+        if catalogue:
+            self._results.write_catalogue(catalogue)
 
     def events(self) -> Iterable[dict[str, Any]]:
         """Generator the SSE endpoint iterates over.
@@ -757,6 +783,13 @@ class Engine:
             # Queue full; drop the event. SSE clients always have the
             # daily-results endpoint as a fallback.
             pass
+        # Errors get persisted to errors/{date}.json so we can audit
+        # what went wrong after the session ends.
+        if event_type == "error":
+            try:
+                self._results.append_error(data)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("could not persist error to GCS: %s", exc)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
